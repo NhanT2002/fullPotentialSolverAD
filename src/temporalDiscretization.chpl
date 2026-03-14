@@ -59,10 +59,7 @@ inline proc isReducedExactJacobianType(jacobianType: string): bool {
 }
 
 proc isWallFace(sd: borrowed spatialDiscretization, face: int): bool {
-    for wallFace in sd.mesh_.edgeWall_ do
-        if wallFace == face then
-            return true;
-    return false;
+    return sd.wallFaceSet_.contains(face);
 }
 
 proc ghostPhiForFace(sd: borrowed spatialDiscretization,
@@ -855,6 +852,15 @@ class temporalDiscretization {
     var rowMergedCols: [rowMergedDataDom] int;
     var rowMergedRowIdx: [rowMergedDataDom] int;
     var rowMergedKuttaIdx: [rowMergedDataDom] int;
+    var cellVelTemplateOffsetDom: domain(1) = {1..0};
+    var cellVelTemplateOffsets: [cellVelTemplateOffsetDom] int;
+    var cellVelTemplateDataDom: domain(1) = {0..<0};
+    var cellVelTemplateCols: [cellVelTemplateDataDom] int;
+    var cellVelTemplateUx: [cellVelTemplateDataDom] real(64);
+    var cellVelTemplateUy: [cellVelTemplateDataDom] real(64);
+    var cellVelTemplateGammaDom: domain(1) = {1..0};
+    var cellVelTemplateGammaUx: [cellVelTemplateGammaDom] real(64);
+    var cellVelTemplateGammaUy: [cellVelTemplateGammaDom] real(64);
     var kuttaStencilCacheDom: domain(1) = {0..<0};
     var kuttaStencilCache: [kuttaStencilCacheDom] int;
 
@@ -995,6 +1001,7 @@ class temporalDiscretization {
         }
         this.computeGradientSensitivity();
         this.initializeStencilCache();
+        this.initializeCellVelocityTemplateCache();
         this.initializeJacobian();
         
         this.computeJacobian();
@@ -1234,6 +1241,132 @@ class temporalDiscretization {
             }
         }
         this.rowFaceOffsets[nelem + 1] = faceOffset;
+    }
+
+    proc initializeCellVelocityTemplateCache() {
+        const nelem = this.spatialDisc_.nelemDomain_;
+        this.cellVelTemplateOffsetDom = {1..nelem + 1};
+        this.cellVelTemplateOffsets = 0;
+        this.cellVelTemplateGammaDom = {1..nelem};
+        this.cellVelTemplateGammaUx = 0.0;
+        this.cellVelTemplateGammaUy = 0.0;
+
+        var totalSize = 0;
+        for elem in 1..nelem {
+            var supportDom: domain(int);
+            var uxCoeff: [supportDom] real(64);
+            var uyCoeff: [supportDom] real(64);
+            var gammaUx = 0.0;
+            var gammaUy = 0.0;
+            const faceStart = this.spatialDisc_.mesh_.elem2edgeIndex_[elem] + 1;
+            const faceEnd = this.spatialDisc_.mesh_.elem2edgeIndex_[elem + 1];
+
+            for faceIdx in faceStart..faceEnd {
+                const face = this.spatialDisc_.mesh_.elem2edge_[faceIdx];
+                const elem1 = this.spatialDisc_.mesh_.edge2elem_[1, face];
+                const elem2 = this.spatialDisc_.mesh_.edge2elem_[2, face];
+                const neighbor = if elem1 == elem then elem2 else elem1;
+
+                var wx, wy: real(64);
+                if elem == elem1 {
+                    wx = this.spatialDisc_.lsGradQR_!.wxFinal1_[face];
+                    wy = this.spatialDisc_.lsGradQR_!.wyFinal1_[face];
+                } else {
+                    wx = this.spatialDisc_.lsGradQR_!.wxFinal2_[face];
+                    wy = this.spatialDisc_.lsGradQR_!.wyFinal2_[face];
+                }
+
+                if neighbor <= nelem {
+                    if !supportDom.contains(neighbor) then supportDom += neighbor;
+                    uxCoeff[neighbor] += wx;
+                    uyCoeff[neighbor] += wy;
+
+                    if !supportDom.contains(elem) then supportDom += elem;
+                    uxCoeff[elem] -= wx;
+                    uyCoeff[elem] -= wy;
+
+                    const elemKuttaType = this.spatialDisc_.kuttaCell_[elem];
+                    const neighborKuttaType = this.spatialDisc_.kuttaCell_[neighbor];
+                    if elemKuttaType == 1 && neighborKuttaType == -1 {
+                        gammaUx += wx;
+                        gammaUy += wy;
+                    } else if elemKuttaType == -1 && neighborKuttaType == 1 {
+                        gammaUx -= wx;
+                        gammaUy -= wy;
+                    }
+                } else if !isWallFace(this.spatialDisc_.borrow(), face) {
+                    if !supportDom.contains(elem) then supportDom += elem;
+                    uxCoeff[elem] -= wx;
+                    uyCoeff[elem] -= wy;
+                }
+            }
+
+            this.cellVelTemplateOffsets[elem] = totalSize;
+            totalSize += supportDom.size;
+            this.cellVelTemplateGammaUx[elem] = gammaUx;
+            this.cellVelTemplateGammaUy[elem] = gammaUy;
+        }
+        this.cellVelTemplateOffsets[nelem + 1] = totalSize;
+
+        this.cellVelTemplateDataDom = {0..<totalSize};
+        this.cellVelTemplateCols = 0;
+        this.cellVelTemplateUx = 0.0;
+        this.cellVelTemplateUy = 0.0;
+
+        for elem in 1..nelem {
+            var supportDom: domain(int);
+            var uxCoeff: [supportDom] real(64);
+            var uyCoeff: [supportDom] real(64);
+            const faceStart = this.spatialDisc_.mesh_.elem2edgeIndex_[elem] + 1;
+            const faceEnd = this.spatialDisc_.mesh_.elem2edgeIndex_[elem + 1];
+
+            for faceIdx in faceStart..faceEnd {
+                const face = this.spatialDisc_.mesh_.elem2edge_[faceIdx];
+                const elem1 = this.spatialDisc_.mesh_.edge2elem_[1, face];
+                const elem2 = this.spatialDisc_.mesh_.edge2elem_[2, face];
+                const neighbor = if elem1 == elem then elem2 else elem1;
+
+                var wx, wy: real(64);
+                if elem == elem1 {
+                    wx = this.spatialDisc_.lsGradQR_!.wxFinal1_[face];
+                    wy = this.spatialDisc_.lsGradQR_!.wyFinal1_[face];
+                } else {
+                    wx = this.spatialDisc_.lsGradQR_!.wxFinal2_[face];
+                    wy = this.spatialDisc_.lsGradQR_!.wyFinal2_[face];
+                }
+
+                if neighbor <= nelem {
+                    if !supportDom.contains(neighbor) then supportDom += neighbor;
+                    uxCoeff[neighbor] += wx;
+                    uyCoeff[neighbor] += wy;
+
+                    if !supportDom.contains(elem) then supportDom += elem;
+                    uxCoeff[elem] -= wx;
+                    uyCoeff[elem] -= wy;
+                } else if !isWallFace(this.spatialDisc_.borrow(), face) {
+                    if !supportDom.contains(elem) then supportDom += elem;
+                    uxCoeff[elem] -= wx;
+                    uyCoeff[elem] -= wy;
+                }
+            }
+
+            const start = this.cellVelTemplateOffsets[elem];
+            const dom = {0..<supportDom.size};
+            var cols: [dom] int;
+            var idx = 0;
+            for col in supportDom {
+                cols[idx] = col;
+                idx += 1;
+            }
+            sort(cols);
+            for localIdx in dom {
+                const col = cols[localIdx];
+                const dataIdx = start + localIdx;
+                this.cellVelTemplateCols[dataIdx] = col;
+                this.cellVelTemplateUx[dataIdx] = uxCoeff[col];
+                this.cellVelTemplateUy[dataIdx] = uyCoeff[col];
+            }
+        }
     }
 
     proc solve() {

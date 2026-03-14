@@ -3,6 +3,95 @@ use temporalDiscretization;
 
 // Hand-coded reduced exact Jacobian assembly.
 
+inline proc addActiveLocalIndex(idx: int,
+                                ref activeMask: [?D] bool,
+                                ref activeList: [D] int,
+                                ref activeCount: int) {
+    if idx >= 0 && !activeMask[idx] {
+        activeMask[idx] = true;
+        activeList[activeCount] = idx;
+        activeCount += 1;
+    }
+}
+
+proc temporalDiscretization.accumulateCellVelocitySensitivityFromTemplateOnStencil(elem: int,
+                                                                                   stencil: [?D] int,
+                                                                                   ref du: [D] real(64),
+                                                                                   ref dv: [D] real(64),
+                                                                                   ref activeMask: [D] bool,
+                                                                                   ref activeList: [D] int,
+                                                                                   ref activeCount: int,
+                                                                                   ref duGamma: real(64),
+                                                                                   ref dvGamma: real(64)) {
+    const start = this.cellVelTemplateOffsets[elem];
+    const stop = this.cellVelTemplateOffsets[elem + 1];
+
+    for dataIdx in start..<stop {
+        const col = this.cellVelTemplateCols[dataIdx];
+        const localIdx = findStencilIndex(stencil, col);
+        if localIdx >= 0 {
+            du[localIdx] += this.cellVelTemplateUx[dataIdx];
+            dv[localIdx] += this.cellVelTemplateUy[dataIdx];
+            addActiveLocalIndex(localIdx, activeMask, activeList, activeCount);
+        }
+    }
+
+    duGamma += this.cellVelTemplateGammaUx[elem];
+    dvGamma += this.cellVelTemplateGammaUy[elem];
+}
+
+proc accumulateDensityMuSensitivityOnActiveIndices(sd: borrowed spatialDiscretization,
+                                                   u: real(64),
+                                                   v: real(64),
+                                                   const ref du: [?D] real(64),
+                                                   const ref dv: [D] real(64),
+                                                   const ref activeList: [D] int,
+                                                   activeCount: int,
+                                                   duGamma: real(64),
+                                                   dvGamma: real(64),
+                                                   ref drho: [D] real(64),
+                                                   ref dmu: [D] real(64),
+                                                   ref drhoGamma: real(64),
+                                                   ref dmuGamma: real(64),
+                                                   out rho: real(64),
+                                                   out mu: real(64)) {
+    const machInf2 = sd.inputs_.MACH_ * sd.inputs_.MACH_;
+    const a = sd.gamma_minus_one_over_two_ * machInf2;
+    const B = 1.0 + a * (1.0 - u * u - v * v);
+    rho = B ** sd.one_over_gamma_minus_one_;
+    const rhoFactor = -2.0 * a * sd.one_over_gamma_minus_one_ *
+                      (B ** (sd.one_over_gamma_minus_one_ - 1.0));
+
+    for activePos in 0..<activeCount {
+        const idx = activeList[activePos];
+        drho[idx] = rhoFactor * (u * du[idx] + v * dv[idx]);
+    }
+    drhoGamma = rhoFactor * (u * duGamma + v * dvGamma);
+
+    const vel2 = u * u + v * v;
+    const rhoPow = rho ** (1.0 - sd.inputs_.GAMMA_);
+    const M2 = machInf2 * vel2 * rhoPow;
+    const Mc2 = sd.inputs_.MACH_C_ * sd.inputs_.MACH_C_;
+    if M2 > Mc2 {
+        mu = sd.inputs_.MU_C_ * (M2 - Mc2);
+        const common = machInf2;
+        for activePos in 0..<activeCount {
+            const idx = activeList[activePos];
+            const dM2 = common * rhoPow * (2.0 * u * du[idx] + 2.0 * v * dv[idx]) +
+                        common * vel2 * (1.0 - sd.inputs_.GAMMA_) *
+                        (rho ** (-sd.inputs_.GAMMA_)) * drho[idx];
+            dmu[idx] = sd.inputs_.MU_C_ * dM2;
+        }
+        const dM2Gamma = common * rhoPow * (2.0 * u * duGamma + 2.0 * v * dvGamma) +
+                         common * vel2 * (1.0 - sd.inputs_.GAMMA_) *
+                         (rho ** (-sd.inputs_.GAMMA_)) * drhoGamma;
+        dmuGamma = sd.inputs_.MU_C_ * dM2Gamma;
+    } else {
+        mu = 0.0;
+        dmuGamma = 0.0;
+    }
+}
+
 proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
     this.A_petsc.zeroEntries();
 
@@ -22,6 +111,8 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
     forall row in rows with (ref mergedVals) {
         const rowStencil = this.buildRowStencil(row);
         const rowDom = {0..<rowStencil.size};
+        const rowFaceStart = this.rowFaceOffsets[row];
+        const rowFaceStop = this.rowFaceOffsets[row + 1];
         var rowDphi: [rowDom] real(64) = 0.0;
         var rowDgamma = 0.0;
         var du1: [rowDom] real(64) = 0.0;
@@ -41,10 +132,61 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
         var drhoFace: [rowDom] real(64) = 0.0;
         var duTmp: [rowDom] real(64) = 0.0;
         var dvTmp: [rowDom] real(64) = 0.0;
-        const rowFaceStart = this.rowFaceOffsets[row];
-        const rowFaceStop = this.rowFaceOffsets[row + 1];
+        var active1Mask: [rowDom] bool = false;
+        var active2Mask: [rowDom] bool = false;
+        var activeTmpMask: [rowDom] bool = false;
+        var faceActiveMask: [rowDom] bool = false;
+        var active1List: [rowDom] int = 0;
+        var active2List: [rowDom] int = 0;
+        var activeTmpList: [rowDom] int = 0;
+        var faceActiveList: [rowDom] int = 0;
+        var active1Count = 0;
+        var active2Count = 0;
+        var activeTmpCount = 0;
+        var faceActiveCount = 0;
 
         for rowFaceIdx in rowFaceStart..<rowFaceStop {
+            for activePos in 0..<active1Count {
+                const idx = active1List[activePos];
+                du1[idx] = 0.0;
+                dv1[idx] = 0.0;
+                active1Mask[idx] = false;
+            }
+            active1Count = 0;
+
+            for activePos in 0..<active2Count {
+                const idx = active2List[activePos];
+                du2[idx] = 0.0;
+                dv2[idx] = 0.0;
+                active2Mask[idx] = false;
+            }
+            active2Count = 0;
+
+            for activePos in 0..<activeTmpCount {
+                const idx = activeTmpList[activePos];
+                duTmp[idx] = 0.0;
+                dvTmp[idx] = 0.0;
+                activeTmpMask[idx] = false;
+            }
+            activeTmpCount = 0;
+
+            for activePos in 0..<faceActiveCount {
+                const idx = faceActiveList[activePos];
+                duAvg[idx] = 0.0;
+                dvAvg[idx] = 0.0;
+                dDeltaPhi[idx] = 0.0;
+                duFaceCoeff[idx] = 0.0;
+                dvFaceCoeff[idx] = 0.0;
+                drhoIsen[idx] = 0.0;
+                drho1Blend[idx] = 0.0;
+                dmu1Blend[idx] = 0.0;
+                drho2Blend[idx] = 0.0;
+                dmu2Blend[idx] = 0.0;
+                drhoFace[idx] = 0.0;
+                faceActiveMask[idx] = false;
+            }
+            faceActiveCount = 0;
+
             const face = this.rowFaceData[rowFaceIdx];
             const elem1 = this.spatialDisc_.mesh_.edge2elem_[1, face];
             const elem2 = this.spatialDisc_.mesh_.edge2elem_[2, face];
@@ -57,22 +199,23 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
             const rhoIsen = this.spatialDisc_.rhoIsenFace_[face];
             const uFace = this.spatialDisc_.uFace_[face];
             const vFace = this.spatialDisc_.vFace_[face];
-            du1 = 0.0;
-            dv1 = 0.0;
-            du2 = 0.0;
-            dv2 = 0.0;
             var du1Gamma = 0.0;
             var dv1Gamma = 0.0;
             var du2Gamma = 0.0;
             var dv2Gamma = 0.0;
 
             if elem1 <= sd.nelemDomain_ {
-                accumulateCellVelocitySensitivityOnStencil(sd, elem1, rowStencil,
-                                                           du1, dv1, du1Gamma, dv1Gamma);
+                this.accumulateCellVelocitySensitivityFromTemplateOnStencil(elem1, rowStencil,
+                                                                            du1, dv1,
+                                                                            active1Mask, active1List, active1Count,
+                                                                            du1Gamma, dv1Gamma);
             } else if isWallFace(sd, face) {
-                accumulateCellVelocitySensitivityOnStencil(sd, elem2, rowStencil,
-                                                           du1, dv1, du1Gamma, dv1Gamma);
-                for idx in rowDom {
+                this.accumulateCellVelocitySensitivityFromTemplateOnStencil(elem2, rowStencil,
+                                                                            du1, dv1,
+                                                                            active1Mask, active1List, active1Count,
+                                                                            du1Gamma, dv1Gamma);
+                for activePos in 0..<active1Count {
+                    const idx = active1List[activePos];
                     const dvDotN = du1[idx] * nx + dv1[idx] * ny;
                     du1[idx] = du1[idx] - 2.0 * dvDotN * nx;
                     dv1[idx] = dv1[idx] - 2.0 * dvDotN * ny;
@@ -83,12 +226,17 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
             }
 
             if elem2 <= sd.nelemDomain_ {
-                accumulateCellVelocitySensitivityOnStencil(sd, elem2, rowStencil,
-                                                           du2, dv2, du2Gamma, dv2Gamma);
+                this.accumulateCellVelocitySensitivityFromTemplateOnStencil(elem2, rowStencil,
+                                                                            du2, dv2,
+                                                                            active2Mask, active2List, active2Count,
+                                                                            du2Gamma, dv2Gamma);
             } else if isWallFace(sd, face) {
-                accumulateCellVelocitySensitivityOnStencil(sd, elem1, rowStencil,
-                                                           du2, dv2, du2Gamma, dv2Gamma);
-                for idx in rowDom {
+                this.accumulateCellVelocitySensitivityFromTemplateOnStencil(elem1, rowStencil,
+                                                                            du2, dv2,
+                                                                            active2Mask, active2List, active2Count,
+                                                                            du2Gamma, dv2Gamma);
+                for activePos in 0..<active2Count {
+                    const idx = active2List[activePos];
                     const dvDotN = du2[idx] * nx + dv2[idx] * ny;
                     du2[idx] = du2[idx] - 2.0 * dvDotN * nx;
                     dv2[idx] = dv2[idx] - 2.0 * dvDotN * ny;
@@ -100,16 +248,24 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
 
             const weight1 = sd.weights1_[face];
             const weight2 = sd.weights2_[face];
-            duAvg = 0.0;
-            dvAvg = 0.0;
-            for idx in rowDom {
+            for activePos in 0..<active1Count do
+                addActiveLocalIndex(active1List[activePos], faceActiveMask, faceActiveList, faceActiveCount);
+            for activePos in 0..<active2Count do
+                addActiveLocalIndex(active2List[activePos], faceActiveMask, faceActiveList, faceActiveCount);
+
+            const idxMinus = this.rowFaceMinusIdx[rowFaceIdx];
+            const idxPlus = this.rowFacePlusIdx[rowFaceIdx];
+            addActiveLocalIndex(idxMinus, faceActiveMask, faceActiveList, faceActiveCount);
+            addActiveLocalIndex(idxPlus, faceActiveMask, faceActiveList, faceActiveCount);
+
+            for activePos in 0..<faceActiveCount {
+                const idx = faceActiveList[activePos];
                 duAvg[idx] = weight1 * du1[idx] + weight2 * du2[idx];
                 dvAvg[idx] = weight1 * dv1[idx] + weight2 * dv2[idx];
             }
             const duAvgGamma = weight1 * du1Gamma + weight2 * du2Gamma;
             const dvAvgGamma = weight1 * dv1Gamma + weight2 * dv2Gamma;
 
-            dDeltaPhi = 0.0;
             var dDeltaPhiGamma = 0.0;
             if elem1 <= sd.nelemDomain_ && elem2 <= sd.nelemDomain_ {
                 const kuttaType1 = sd.kuttaCell_[elem1];
@@ -119,14 +275,11 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
                 else if kuttaType1 == -1 && kuttaType2 == 1 then
                     dDeltaPhiGamma = -1.0;
             }
-            const idxMinus = this.rowFaceMinusIdx[rowFaceIdx];
-            const idxPlus = this.rowFacePlusIdx[rowFaceIdx];
             if idxMinus >= 0 then dDeltaPhi[idxMinus] -= 1.0;
             if idxPlus >= 0 then dDeltaPhi[idxPlus] += 1.0;
 
-            duFaceCoeff = 0.0;
-            dvFaceCoeff = 0.0;
-            for idx in rowDom {
+            for activePos in 0..<faceActiveCount {
+                const idx = faceActiveList[activePos];
                 const ddelta = duAvg[idx] * sd.t_IJ_x_[face] + dvAvg[idx] * sd.t_IJ_y_[face] -
                                dDeltaPhi[idx] * sd.invL_IJ_[face];
                 duFaceCoeff[idx] = duAvg[idx] - ddelta * sd.corrCoeffX_[face];
@@ -142,45 +295,44 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
             const BFace = 1.0 + a * (1.0 - uFace * uFace - vFace * vFace);
             const rhoFaceFactor = -2.0 * a * sd.one_over_gamma_minus_one_ *
                                   (BFace ** (sd.one_over_gamma_minus_one_ - 1.0));
-            drhoIsen = 0.0;
-            for idx in rowDom do
+            for activePos in 0..<faceActiveCount {
+                const idx = faceActiveList[activePos];
                 drhoIsen[idx] = rhoFaceFactor * (uFace * duFaceCoeff[idx] + vFace * dvFaceCoeff[idx]);
+            }
             const drhoIsenGamma = rhoFaceFactor * (uFace * duFaceGamma + vFace * dvFaceGamma);
 
             var rho1Blend, mu1Blend, rho2Blend, mu2Blend: real(64);
-            drho1Blend = 0.0;
-            dmu1Blend = 0.0;
-            drho2Blend = 0.0;
-            dmu2Blend = 0.0;
             var drho1BlendGamma, dmu1BlendGamma, drho2BlendGamma, dmu2BlendGamma: real(64);
 
             if elem1 <= sd.nelemDomain_ {
                 rho1Blend = sd.rhorho_[elem1];
                 mu1Blend = sd.mumu_[elem1];
-                accumulateDensityMuSensitivityFromVelocityOnStencil(sd, sd.uu_[elem1], sd.vv_[elem1],
-                                                                    du1, dv1, du1Gamma, dv1Gamma,
-                                                                    drho1Blend, dmu1Blend,
-                                                                    drho1BlendGamma, dmu1BlendGamma,
-                                                                    rho1Blend, mu1Blend);
+                accumulateDensityMuSensitivityOnActiveIndices(sd, sd.uu_[elem1], sd.vv_[elem1],
+                                                              du1, dv1, active1List, active1Count,
+                                                              du1Gamma, dv1Gamma,
+                                                              drho1Blend, dmu1Blend,
+                                                              drho1BlendGamma, dmu1BlendGamma,
+                                                              rho1Blend, mu1Blend);
             } else if isWallFace(sd, face) {
                 rho1Blend = sd.rhorho_[elem2];
                 mu1Blend = sd.mumu_[elem2];
-                duTmp = 0.0;
-                dvTmp = 0.0;
                 var duTmpGamma = 0.0;
                 var dvTmpGamma = 0.0;
-                accumulateCellVelocitySensitivityOnStencil(sd, elem2, rowStencil,
-                                                           duTmp, dvTmp, duTmpGamma, dvTmpGamma);
-                accumulateDensityMuSensitivityFromVelocityOnStencil(sd, sd.uu_[elem2], sd.vv_[elem2],
-                                                                    duTmp, dvTmp, duTmpGamma, dvTmpGamma,
-                                                                    drho1Blend, dmu1Blend,
-                                                                    drho1BlendGamma, dmu1BlendGamma,
-                                                                    rho1Blend, mu1Blend);
+                this.accumulateCellVelocitySensitivityFromTemplateOnStencil(elem2, rowStencil,
+                                                                            duTmp, dvTmp,
+                                                                            activeTmpMask, activeTmpList, activeTmpCount,
+                                                                            duTmpGamma, dvTmpGamma);
+                accumulateDensityMuSensitivityOnActiveIndices(sd, sd.uu_[elem2], sd.vv_[elem2],
+                                                              duTmp, dvTmp, activeTmpList, activeTmpCount,
+                                                              duTmpGamma, dvTmpGamma,
+                                                              drho1Blend, dmu1Blend,
+                                                              drho1BlendGamma, dmu1BlendGamma,
+                                                              rho1Blend, mu1Blend);
+                for activePos in 0..<activeTmpCount do
+                    addActiveLocalIndex(activeTmpList[activePos], faceActiveMask, faceActiveList, faceActiveCount);
             } else {
                 rho1Blend = 0.0;
                 mu1Blend = 0.0;
-                drho1Blend = 0.0;
-                dmu1Blend = 0.0;
                 drho1BlendGamma = 0.0;
                 dmu1BlendGamma = 0.0;
             }
@@ -188,30 +340,32 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
             if elem2 <= sd.nelemDomain_ {
                 rho2Blend = sd.rhorho_[elem2];
                 mu2Blend = sd.mumu_[elem2];
-                accumulateDensityMuSensitivityFromVelocityOnStencil(sd, sd.uu_[elem2], sd.vv_[elem2],
-                                                                    du2, dv2, du2Gamma, dv2Gamma,
-                                                                    drho2Blend, dmu2Blend,
-                                                                    drho2BlendGamma, dmu2BlendGamma,
-                                                                    rho2Blend, mu2Blend);
+                accumulateDensityMuSensitivityOnActiveIndices(sd, sd.uu_[elem2], sd.vv_[elem2],
+                                                              du2, dv2, active2List, active2Count,
+                                                              du2Gamma, dv2Gamma,
+                                                              drho2Blend, dmu2Blend,
+                                                              drho2BlendGamma, dmu2BlendGamma,
+                                                              rho2Blend, mu2Blend);
             } else if isWallFace(sd, face) {
                 rho2Blend = sd.rhorho_[elem1];
                 mu2Blend = sd.mumu_[elem1];
-                duTmp = 0.0;
-                dvTmp = 0.0;
                 var duTmpGamma = 0.0;
                 var dvTmpGamma = 0.0;
-                accumulateCellVelocitySensitivityOnStencil(sd, elem1, rowStencil,
-                                                           duTmp, dvTmp, duTmpGamma, dvTmpGamma);
-                accumulateDensityMuSensitivityFromVelocityOnStencil(sd, sd.uu_[elem1], sd.vv_[elem1],
-                                                                    duTmp, dvTmp, duTmpGamma, dvTmpGamma,
-                                                                    drho2Blend, dmu2Blend,
-                                                                    drho2BlendGamma, dmu2BlendGamma,
-                                                                    rho2Blend, mu2Blend);
+                this.accumulateCellVelocitySensitivityFromTemplateOnStencil(elem1, rowStencil,
+                                                                            duTmp, dvTmp,
+                                                                            activeTmpMask, activeTmpList, activeTmpCount,
+                                                                            duTmpGamma, dvTmpGamma);
+                accumulateDensityMuSensitivityOnActiveIndices(sd, sd.uu_[elem1], sd.vv_[elem1],
+                                                              duTmp, dvTmp, activeTmpList, activeTmpCount,
+                                                              duTmpGamma, dvTmpGamma,
+                                                              drho2Blend, dmu2Blend,
+                                                              drho2BlendGamma, dmu2BlendGamma,
+                                                              rho2Blend, mu2Blend);
+                for activePos in 0..<activeTmpCount do
+                    addActiveLocalIndex(activeTmpList[activePos], faceActiveMask, faceActiveList, faceActiveCount);
             } else {
                 rho2Blend = 0.0;
                 mu2Blend = 0.0;
-                drho2Blend = 0.0;
-                dmu2Blend = 0.0;
                 drho2BlendGamma = 0.0;
                 dmu2BlendGamma = 0.0;
             }
@@ -222,10 +376,10 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
             const drhoUpwindGamma = if useElem1Upwind then drho1BlendGamma else drho2BlendGamma;
             const dmuUpwindGamma = if useElem1Upwind then dmu1BlendGamma else dmu2BlendGamma;
 
-            drhoFace = 0.0;
             var drhoFaceGamma = drhoIsenGamma;
             if muUpwind > 0.0 {
-                for idx in rowDom {
+                for activePos in 0..<faceActiveCount {
+                    const idx = faceActiveList[activePos];
                     const drhoUpwind = if useElem1Upwind then drho1Blend[idx] else drho2Blend[idx];
                     const dmuUpwind = if useElem1Upwind then dmu1Blend[idx] else dmu2Blend[idx];
                     drhoFace[idx] = (1.0 - muUpwind) * drhoIsen[idx] + muUpwind * drhoUpwind +
@@ -234,10 +388,14 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
                 drhoFaceGamma = (1.0 - muUpwind) * drhoIsenGamma + muUpwind * drhoUpwindGamma +
                                 (rhoUpwind - rhoIsen) * dmuUpwindGamma;
             } else {
-                drhoFace = drhoIsen;
+                for activePos in 0..<faceActiveCount {
+                    const idx = faceActiveList[activePos];
+                    drhoFace[idx] = drhoIsen[idx];
+                }
             }
 
-            for idx in rowDom {
+            for activePos in 0..<faceActiveCount {
+                const idx = faceActiveList[activePos];
                 const dq = duFaceCoeff[idx] * nx + dvFaceCoeff[idx] * ny;
                 rowDphi[idx] += sign * area * (drhoFace[idx] * qFace + rhoFace * dq) * sd.res_scale_;
             }
