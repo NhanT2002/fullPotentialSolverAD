@@ -12,9 +12,796 @@ use C_PETSC;
 use petsc;
 use CTypes;
 use List;
+use Set;
 use gmres;
 use Sort;
 use IO;
+// Keep nonlinear iteration control here and split the Jacobian assembly
+// implementations into dedicated extension-method modules.
+use temporalDiscretizationAD;
+use temporalDiscretizationAnalyticalApprox;
+use temporalDiscretizationAnalyticalExact;
+
+config const CHECK_AD_ROW = false;
+config const AD_ROW = 0;
+config const AD_ROW_CHECK_ONLY = false;
+config const AD_FD_EPS = 1.0e-7;
+config const AD_ROW_PRINT_TOL = 1.0e-9;
+config const AD_ROW_MAX_PRINT = 40;
+config const AD_JACOBIAN_PROGRESS_FREQ = 0;
+
+extern {
+    int enzyme_dup;
+    int enzyme_const;
+    void __enzyme_autodiff(void*, ...);
+}
+
+inline proc phiFromPtr(phiPtr: c_ptr(real(64)), elem: int): real(64) {
+    return phiPtr[elem - 1];
+}
+
+inline proc gammaFromPtr(gammaPtr: c_ptr(real(64))): real(64) {
+    return gammaPtr[0];
+}
+
+inline proc phiSeedDerivative(elem: int, seedCol: int, wrtGamma: bool): real(64) {
+    if wrtGamma then
+        return 0.0;
+    return if elem == seedCol then 1.0 else 0.0;
+}
+
+inline proc gammaSeedDerivative(wrtGamma: bool): real(64) {
+    return if wrtGamma then 1.0 else 0.0;
+}
+
+inline proc isReducedExactJacobianType(jacobianType: string): bool {
+    return jacobianType == "ad_reduced_exact" || jacobianType == "analytical_reduced_exact";
+}
+
+proc isWallFace(sd: borrowed spatialDiscretization, face: int): bool {
+    for wallFace in sd.mesh_.edgeWall_ do
+        if wallFace == face then
+            return true;
+    return false;
+}
+
+proc ghostPhiForFace(sd: borrowed spatialDiscretization,
+                     phiPtr: c_ptr(real(64)),
+                     face: int,
+                     interiorElem: int,
+                     ghostElem: int): real(64) {
+    if isWallFace(sd, face) then
+        return phiFromPtr(phiPtr, interiorElem);
+
+    const x = sd.elemCentroidX_[ghostElem];
+    const y = sd.elemCentroidY_[ghostElem];
+    if sd.farfieldIsCylinder_ {
+        const R = sd.inputs_.CYLINDER_RADIUS_;
+        const r2 = x * x + y * y;
+        const r = sqrt(r2);
+        const theta = atan2(y, x);
+        return sd.inputs_.VEL_INF_ * (r + R * R / r) * cos(theta);
+    }
+
+    return sd.inputs_.U_INF_ * x + sd.inputs_.V_INF_ * y;
+}
+
+proc ghostPhiForFaceWithDerivative(sd: borrowed spatialDiscretization,
+                                   phiPtr: c_ptr(real(64)),
+                                   face: int,
+                                   interiorElem: int,
+                                   ghostElem: int,
+                                   seedCol: int,
+                                   wrtGamma: bool): (real(64), real(64)) {
+    if isWallFace(sd, face) then
+        return (phiFromPtr(phiPtr, interiorElem),
+                phiSeedDerivative(interiorElem, seedCol, wrtGamma));
+
+    const x = sd.elemCentroidX_[ghostElem];
+    const y = sd.elemCentroidY_[ghostElem];
+    if sd.farfieldIsCylinder_ {
+        const R = sd.inputs_.CYLINDER_RADIUS_;
+        const r2 = x * x + y * y;
+        const r = sqrt(r2);
+        const theta = atan2(y, x);
+        return (sd.inputs_.VEL_INF_ * (r + R * R / r) * cos(theta), 0.0);
+    }
+
+    return (sd.inputs_.U_INF_ * x + sd.inputs_.V_INF_ * y, 0.0);
+}
+
+proc computeVelocityForCellFromPtr(sd: borrowed spatialDiscretization,
+                                   phiPtr: c_ptr(real(64)),
+                                   gammaPtr: c_ptr(real(64)),
+                                   elem: int): (real(64), real(64)) {
+    const phiI = phiFromPtr(phiPtr, elem);
+    const gamma = gammaFromPtr(gammaPtr);
+    var gx = 0.0;
+    var gy = 0.0;
+    const faceStart = sd.mesh_.elem2edgeIndex_[elem] + 1;
+    const faceEnd = sd.mesh_.elem2edgeIndex_[elem + 1];
+
+    for faceIdx in faceStart..faceEnd {
+        const face = sd.mesh_.elem2edge_[faceIdx];
+        const elem1 = sd.mesh_.edge2elem_[1, face];
+        const elem2 = sd.mesh_.edge2elem_[2, face];
+        const neighbor = if elem1 == elem then elem2 else elem1;
+
+        var phiJ: real(64);
+        if neighbor <= sd.nelemDomain_ {
+            phiJ = phiFromPtr(phiPtr, neighbor);
+
+            const elemKuttaType = sd.kuttaCell_[elem];
+            const neighborKuttaType = sd.kuttaCell_[neighbor];
+            if elemKuttaType == 1 && neighborKuttaType == -1 then
+                phiJ += gamma;
+            else if elemKuttaType == -1 && neighborKuttaType == 1 then
+                phiJ -= gamma;
+        } else {
+            phiJ = ghostPhiForFace(sd, phiPtr, face, elem, neighbor);
+        }
+
+        const dphi = phiJ - phiI;
+        if elem == elem1 {
+            gx += sd.lsGradQR_!.wxFinal1_[face] * dphi;
+            gy += sd.lsGradQR_!.wyFinal1_[face] * dphi;
+        } else {
+            gx += sd.lsGradQR_!.wxFinal2_[face] * dphi;
+            gy += sd.lsGradQR_!.wyFinal2_[face] * dphi;
+        }
+    }
+
+    return (gx, gy);
+}
+
+proc computeVelocityForCellFromPtrWithDerivative(sd: borrowed spatialDiscretization,
+                                                 phiPtr: c_ptr(real(64)),
+                                                 gammaPtr: c_ptr(real(64)),
+                                                 elem: int,
+                                                 seedCol: int,
+                                                 wrtGamma: bool): (real(64), real(64), real(64), real(64)) {
+    const phiI = phiFromPtr(phiPtr, elem);
+    const dphiI = phiSeedDerivative(elem, seedCol, wrtGamma);
+    const gamma = gammaFromPtr(gammaPtr);
+    const dgamma = gammaSeedDerivative(wrtGamma);
+
+    var gx = 0.0;
+    var gy = 0.0;
+    var dgx = 0.0;
+    var dgy = 0.0;
+    const faceStart = sd.mesh_.elem2edgeIndex_[elem] + 1;
+    const faceEnd = sd.mesh_.elem2edgeIndex_[elem + 1];
+
+    for faceIdx in faceStart..faceEnd {
+        const face = sd.mesh_.elem2edge_[faceIdx];
+        const elem1 = sd.mesh_.edge2elem_[1, face];
+        const elem2 = sd.mesh_.edge2elem_[2, face];
+        const neighbor = if elem1 == elem then elem2 else elem1;
+
+        var phiJ: real(64);
+        var dphiJ: real(64);
+        if neighbor <= sd.nelemDomain_ {
+            phiJ = phiFromPtr(phiPtr, neighbor);
+            dphiJ = phiSeedDerivative(neighbor, seedCol, wrtGamma);
+
+            const elemKuttaType = sd.kuttaCell_[elem];
+            const neighborKuttaType = sd.kuttaCell_[neighbor];
+            if elemKuttaType == 1 && neighborKuttaType == -1 {
+                phiJ += gamma;
+                dphiJ += dgamma;
+            } else if elemKuttaType == -1 && neighborKuttaType == 1 {
+                phiJ -= gamma;
+                dphiJ -= dgamma;
+            }
+        } else {
+            (phiJ, dphiJ) = ghostPhiForFaceWithDerivative(sd, phiPtr, face, elem, neighbor,
+                                                          seedCol, wrtGamma);
+        }
+
+        const dphi = phiJ - phiI;
+        const ddphi = dphiJ - dphiI;
+        if elem == elem1 {
+            gx += sd.lsGradQR_!.wxFinal1_[face] * dphi;
+            gy += sd.lsGradQR_!.wyFinal1_[face] * dphi;
+            dgx += sd.lsGradQR_!.wxFinal1_[face] * ddphi;
+            dgy += sd.lsGradQR_!.wyFinal1_[face] * ddphi;
+        } else {
+            gx += sd.lsGradQR_!.wxFinal2_[face] * dphi;
+            gy += sd.lsGradQR_!.wyFinal2_[face] * dphi;
+            dgx += sd.lsGradQR_!.wxFinal2_[face] * ddphi;
+            dgy += sd.lsGradQR_!.wyFinal2_[face] * ddphi;
+        }
+    }
+
+    return (gx, gy, dgx, dgy);
+}
+
+proc computeDensityAndMuFromVelocity(sd: borrowed spatialDiscretization,
+                                     u: real(64),
+                                     v: real(64)): (real(64), real(64), real(64)) {
+    const rho = (1.0 + sd.gamma_minus_one_over_two_ * sd.inputs_.MACH_ * sd.inputs_.MACH_ *
+                (1.0 - u * u - v * v)) ** sd.one_over_gamma_minus_one_;
+    const mach = sd.mach(u, v, rho);
+    const M2 = mach * mach;
+    const Mc2 = sd.inputs_.MACH_C_ * sd.inputs_.MACH_C_;
+    const excessMach2 = max(0.0, M2 - Mc2);
+    const mu = sd.inputs_.MU_C_ * excessMach2;
+    return (rho, mach, mu);
+}
+
+proc computeDensityAndMuFromVelocityWithDerivative(sd: borrowed spatialDiscretization,
+                                                   u: real(64),
+                                                   v: real(64),
+                                                   du: real(64),
+                                                   dv: real(64)): (real(64), real(64), real(64), real(64)) {
+    const machInf2 = sd.inputs_.MACH_ * sd.inputs_.MACH_;
+    const a = sd.gamma_minus_one_over_two_ * machInf2;
+    const B = 1.0 + a * (1.0 - u * u - v * v);
+    const rho = B ** sd.one_over_gamma_minus_one_;
+    const dB = -2.0 * a * (u * du + v * dv);
+    const drho = sd.one_over_gamma_minus_one_ * (B ** (sd.one_over_gamma_minus_one_ - 1.0)) * dB;
+
+    const vel2 = u * u + v * v;
+    const rhoPow = rho ** (1.0 - sd.inputs_.GAMMA_);
+    const M2 = machInf2 * vel2 * rhoPow;
+    var dM2 = machInf2 * rhoPow * (2.0 * u * du + 2.0 * v * dv);
+    dM2 += machInf2 * vel2 * (1.0 - sd.inputs_.GAMMA_) * (rho ** (-sd.inputs_.GAMMA_)) * drho;
+
+    const Mc2 = sd.inputs_.MACH_C_ * sd.inputs_.MACH_C_;
+    const mu = if M2 > Mc2 then sd.inputs_.MU_C_ * (M2 - Mc2) else 0.0;
+    const dmu = if M2 > Mc2 then sd.inputs_.MU_C_ * dM2 else 0.0;
+
+    return (rho, mu, drho, dmu);
+}
+
+private proc computeGhostVelocityForFace(sd: borrowed spatialDiscretization,
+                                         phiPtr: c_ptr(real(64)),
+                                         gammaPtr: c_ptr(real(64)),
+                                         face: int,
+                                         interiorElem: int): (real(64), real(64)) {
+    const (uInt, vInt) = computeVelocityForCellFromPtr(sd, phiPtr, gammaPtr, interiorElem);
+
+    if isWallFace(sd, face) {
+        const nx = sd.faceNormalX_[face];
+        const ny = sd.faceNormalY_[face];
+        const vDotN = uInt * nx + vInt * ny;
+        return (uInt - 2.0 * vDotN * nx, vInt - 2.0 * vDotN * ny);
+    }
+
+    const x = sd.faceCentroidX_[face];
+    const y = sd.faceCentroidY_[face];
+    var uFaceBC: real(64);
+    var vFaceBC: real(64);
+
+    if sd.farfieldIsCylinder_ {
+        const R = sd.inputs_.CYLINDER_RADIUS_;
+        const r2 = x * x + y * y;
+        const R2_over_r2 = R * R / r2;
+        const theta = atan2(y, x);
+        const cosTheta = cos(theta);
+        const sinTheta = sin(theta);
+
+        const Vr = sd.inputs_.VEL_INF_ * (1.0 - R2_over_r2) * cosTheta;
+        const Vtheta = -sd.inputs_.VEL_INF_ * (1.0 + R2_over_r2) * sinTheta;
+        uFaceBC = Vr * cosTheta - Vtheta * sinTheta;
+        vFaceBC = Vr * sinTheta + Vtheta * cosTheta;
+    } else {
+        uFaceBC = sd.inputs_.U_INF_;
+        vFaceBC = sd.inputs_.V_INF_;
+    }
+
+    return (2.0 * uFaceBC - uInt, 2.0 * vFaceBC - vInt);
+}
+
+private proc computeGhostVelocityForFaceWithDerivative(sd: borrowed spatialDiscretization,
+                                                       phiPtr: c_ptr(real(64)),
+                                                       gammaPtr: c_ptr(real(64)),
+                                                       face: int,
+                                                       interiorElem: int,
+                                                       seedCol: int,
+                                                       wrtGamma: bool): (real(64), real(64), real(64), real(64)) {
+    const (uInt, vInt, duInt, dvInt) =
+        computeVelocityForCellFromPtrWithDerivative(sd, phiPtr, gammaPtr, interiorElem,
+                                                    seedCol, wrtGamma);
+
+    if isWallFace(sd, face) {
+        const nx = sd.faceNormalX_[face];
+        const ny = sd.faceNormalY_[face];
+        const vDotN = uInt * nx + vInt * ny;
+        const dvDotN = duInt * nx + dvInt * ny;
+        return (uInt - 2.0 * vDotN * nx,
+                vInt - 2.0 * vDotN * ny,
+                duInt - 2.0 * dvDotN * nx,
+                dvInt - 2.0 * dvDotN * ny);
+    }
+
+    const x = sd.faceCentroidX_[face];
+    const y = sd.faceCentroidY_[face];
+    var uFaceBC: real(64);
+    var vFaceBC: real(64);
+
+    if sd.farfieldIsCylinder_ {
+        const R = sd.inputs_.CYLINDER_RADIUS_;
+        const r2 = x * x + y * y;
+        const R2_over_r2 = R * R / r2;
+        const theta = atan2(y, x);
+        const cosTheta = cos(theta);
+        const sinTheta = sin(theta);
+
+        const Vr = sd.inputs_.VEL_INF_ * (1.0 - R2_over_r2) * cosTheta;
+        const Vtheta = -sd.inputs_.VEL_INF_ * (1.0 + R2_over_r2) * sinTheta;
+        uFaceBC = Vr * cosTheta - Vtheta * sinTheta;
+        vFaceBC = Vr * sinTheta + Vtheta * cosTheta;
+    } else {
+        uFaceBC = sd.inputs_.U_INF_;
+        vFaceBC = sd.inputs_.V_INF_;
+    }
+
+    return (2.0 * uFaceBC - uInt,
+            2.0 * vFaceBC - vInt,
+            -duInt,
+            -dvInt);
+}
+
+private proc computeRhoMuForElemOnFace(sd: borrowed spatialDiscretization,
+                                       phiPtr: c_ptr(real(64)),
+                                       gammaPtr: c_ptr(real(64)),
+                                       face: int,
+                                       elem: int): (real(64), real(64)) {
+    if elem <= sd.nelemDomain_ {
+        const (u, v) = computeVelocityForCellFromPtr(sd, phiPtr, gammaPtr, elem);
+        const (rho, mach, mu) = computeDensityAndMuFromVelocity(sd, u, v);
+        return (rho, mu);
+    }
+
+    const elem1 = sd.mesh_.edge2elem_[1, face];
+    const elem2 = sd.mesh_.edge2elem_[2, face];
+    const interiorElem = if elem1 <= sd.nelemDomain_ then elem1 else elem2;
+
+    if isWallFace(sd, face) {
+        const (u, v) = computeVelocityForCellFromPtr(sd, phiPtr, gammaPtr, interiorElem);
+        const (rho, mach, mu) = computeDensityAndMuFromVelocity(sd, u, v);
+        return (rho, mu);
+    }
+
+    const (uGhost, vGhost) = computeGhostVelocityForFace(sd, phiPtr, gammaPtr, face, interiorElem);
+    const (rhoGhost, machGhost, muGhost) = computeDensityAndMuFromVelocity(sd, uGhost, vGhost);
+    return (rhoGhost, muGhost);
+}
+
+private proc computeRhoMuForElemOnFaceWithDerivative(sd: borrowed spatialDiscretization,
+                                                     phiPtr: c_ptr(real(64)),
+                                                     gammaPtr: c_ptr(real(64)),
+                                                     face: int,
+                                                     elem: int,
+                                                     seedCol: int,
+                                                     wrtGamma: bool): (real(64), real(64), real(64), real(64)) {
+    if elem <= sd.nelemDomain_ {
+        const (u, v, du, dv) =
+            computeVelocityForCellFromPtrWithDerivative(sd, phiPtr, gammaPtr, elem, seedCol, wrtGamma);
+        const (rho, mu, drho, dmu) = computeDensityAndMuFromVelocityWithDerivative(sd, u, v, du, dv);
+        return (rho, mu, drho, dmu);
+    }
+
+    const elem1 = sd.mesh_.edge2elem_[1, face];
+    const elem2 = sd.mesh_.edge2elem_[2, face];
+    const interiorElem = if elem1 <= sd.nelemDomain_ then elem1 else elem2;
+
+    if isWallFace(sd, face) {
+        const (u, v, du, dv) =
+            computeVelocityForCellFromPtrWithDerivative(sd, phiPtr, gammaPtr, interiorElem,
+                                                        seedCol, wrtGamma);
+        const (rho, mu, drho, dmu) = computeDensityAndMuFromVelocityWithDerivative(sd, u, v, du, dv);
+        return (rho, mu, drho, dmu);
+    }
+
+    const (uGhost, vGhost, duGhost, dvGhost) =
+        computeGhostVelocityForFaceWithDerivative(sd, phiPtr, gammaPtr, face, interiorElem,
+                                                  seedCol, wrtGamma);
+    const (rhoGhost, muGhost, drhoGhost, dmuGhost) =
+        computeDensityAndMuFromVelocityWithDerivative(sd, uGhost, vGhost, duGhost, dvGhost);
+    return (rhoGhost, muGhost, drhoGhost, dmuGhost);
+}
+
+proc residualRowForAD(sd: borrowed spatialDiscretization,
+                      elem: int,
+                      phiPtr: c_ptr(real(64)),
+                      gammaPtr: c_ptr(real(64)),
+                      n: c_int): real(64) {
+    const gamma = gammaFromPtr(gammaPtr);
+    var res = 0.0;
+    const faceStart = sd.mesh_.elem2edgeIndex_[elem] + 1;
+    const faceEnd = sd.mesh_.elem2edgeIndex_[elem + 1];
+
+    for faceIdx in faceStart..faceEnd {
+        const face = sd.mesh_.elem2edge_[faceIdx];
+        const elem1 = sd.mesh_.edge2elem_[1, face];
+        const elem2 = sd.mesh_.edge2elem_[2, face];
+        const sign = if elem1 == elem then 1.0 else -1.0;
+
+        var u1, v1, u2, v2: real(64);
+        if elem1 <= sd.nelemDomain_ {
+            (u1, v1) = computeVelocityForCellFromPtr(sd, phiPtr, gammaPtr, elem1);
+        } else {
+            (u1, v1) = computeGhostVelocityForFace(sd, phiPtr, gammaPtr, face, elem2);
+        }
+
+        if elem2 <= sd.nelemDomain_ {
+            (u2, v2) = computeVelocityForCellFromPtr(sd, phiPtr, gammaPtr, elem2);
+        } else {
+            (u2, v2) = computeGhostVelocityForFace(sd, phiPtr, gammaPtr, face, elem1);
+        }
+
+        const uAvg = sd.weights1_[face] * u1 + sd.weights2_[face] * u2;
+        const vAvg = sd.weights1_[face] * v1 + sd.weights2_[face] * v2;
+
+        var phi1: real(64);
+        var phi2: real(64);
+        if elem1 <= sd.nelemDomain_ then
+            phi1 = phiFromPtr(phiPtr, elem1);
+        else
+            phi1 = ghostPhiForFace(sd, phiPtr, face, elem2, elem1);
+
+        if elem2 <= sd.nelemDomain_ then
+            phi2 = phiFromPtr(phiPtr, elem2);
+        else
+            phi2 = ghostPhiForFace(sd, phiPtr, face, elem1, elem2);
+
+        if elem1 <= sd.nelemDomain_ && elem2 <= sd.nelemDomain_ {
+            const kuttaType1 = sd.kuttaCell_[elem1];
+            const kuttaType2 = sd.kuttaCell_[elem2];
+            if kuttaType1 == 1 && kuttaType2 == -1 then
+                phi2 += gamma;
+            else if kuttaType1 == -1 && kuttaType2 == 1 then
+                phi2 -= gamma;
+        }
+
+        const dPhidl = (phi2 - phi1) * sd.invL_IJ_[face];
+        const vDotT = uAvg * sd.t_IJ_x_[face] + vAvg * sd.t_IJ_y_[face];
+        const delta = vDotT - dPhidl;
+        const uFace = uAvg - delta * sd.corrCoeffX_[face];
+        const vFace = vAvg - delta * sd.corrCoeffY_[face];
+        var rhoFace = (1.0 + sd.gamma_minus_one_over_two_ * sd.inputs_.MACH_ * sd.inputs_.MACH_ *
+                      (1.0 - uFace * uFace - vFace * vFace)) ** sd.one_over_gamma_minus_one_;
+
+        const nx = sd.faceNormalX_[face];
+        const ny = sd.faceNormalY_[face];
+        const vDotN = uFace * nx + vFace * ny;
+
+        const (rho1Blend, mu1Blend) = computeRhoMuForElemOnFace(sd, phiPtr, gammaPtr, face, elem1);
+        const (rho2Blend, mu2Blend) = computeRhoMuForElemOnFace(sd, phiPtr, gammaPtr, face, elem2);
+        const upwindWeight = if vDotN >= 0.0 then 1.0 else 0.0;
+        const rhoUpwind = upwindWeight * rho1Blend + (1.0 - upwindWeight) * rho2Blend;
+        const muUpwind = upwindWeight * mu1Blend + (1.0 - upwindWeight) * mu2Blend;
+        if muUpwind > 0.0 then
+            rhoFace = rhoFace - muUpwind * (rhoFace - rhoUpwind);
+
+        res += sign * rhoFace * vDotN * sd.faceArea_[face];
+    }
+
+    return res * sd.res_scale_;
+}
+
+proc residualRowDerivativeAnalytical(sd: borrowed spatialDiscretization,
+                                             elem: int,
+                                             phiPtr: c_ptr(real(64)),
+                                             gammaPtr: c_ptr(real(64)),
+                                             seedCol: int,
+                                             wrtGamma: bool,
+                                             n: c_int): real(64) {
+    const gamma = gammaFromPtr(gammaPtr);
+    const dgamma = gammaSeedDerivative(wrtGamma);
+    var dres = 0.0;
+    const faceStart = sd.mesh_.elem2edgeIndex_[elem] + 1;
+    const faceEnd = sd.mesh_.elem2edgeIndex_[elem + 1];
+
+    for faceIdx in faceStart..faceEnd {
+        const face = sd.mesh_.elem2edge_[faceIdx];
+        const elem1 = sd.mesh_.edge2elem_[1, face];
+        const elem2 = sd.mesh_.edge2elem_[2, face];
+        const sign = if elem1 == elem then 1.0 else -1.0;
+
+        var u1, v1, du1, dv1, u2, v2, du2, dv2: real(64);
+        if elem1 <= sd.nelemDomain_ {
+            (u1, v1, du1, dv1) =
+                computeVelocityForCellFromPtrWithDerivative(sd, phiPtr, gammaPtr, elem1, seedCol, wrtGamma);
+        } else {
+            (u1, v1, du1, dv1) =
+                computeGhostVelocityForFaceWithDerivative(sd, phiPtr, gammaPtr, face, elem2, seedCol, wrtGamma);
+        }
+
+        if elem2 <= sd.nelemDomain_ {
+            (u2, v2, du2, dv2) =
+                computeVelocityForCellFromPtrWithDerivative(sd, phiPtr, gammaPtr, elem2, seedCol, wrtGamma);
+        } else {
+            (u2, v2, du2, dv2) =
+                computeGhostVelocityForFaceWithDerivative(sd, phiPtr, gammaPtr, face, elem1, seedCol, wrtGamma);
+        }
+
+        const uAvg = sd.weights1_[face] * u1 + sd.weights2_[face] * u2;
+        const vAvg = sd.weights1_[face] * v1 + sd.weights2_[face] * v2;
+        const duAvg = sd.weights1_[face] * du1 + sd.weights2_[face] * du2;
+        const dvAvg = sd.weights1_[face] * dv1 + sd.weights2_[face] * dv2;
+
+        var phi1, dphi1, phi2, dphi2: real(64);
+        if elem1 <= sd.nelemDomain_ {
+            phi1 = phiFromPtr(phiPtr, elem1);
+            dphi1 = phiSeedDerivative(elem1, seedCol, wrtGamma);
+        } else {
+            (phi1, dphi1) = ghostPhiForFaceWithDerivative(sd, phiPtr, face, elem2, elem1,
+                                                          seedCol, wrtGamma);
+        }
+
+        if elem2 <= sd.nelemDomain_ {
+            phi2 = phiFromPtr(phiPtr, elem2);
+            dphi2 = phiSeedDerivative(elem2, seedCol, wrtGamma);
+        } else {
+            (phi2, dphi2) = ghostPhiForFaceWithDerivative(sd, phiPtr, face, elem1, elem2,
+                                                          seedCol, wrtGamma);
+        }
+
+        if elem1 <= sd.nelemDomain_ && elem2 <= sd.nelemDomain_ {
+            const kuttaType1 = sd.kuttaCell_[elem1];
+            const kuttaType2 = sd.kuttaCell_[elem2];
+            if kuttaType1 == 1 && kuttaType2 == -1 {
+                phi2 += gamma;
+                dphi2 += dgamma;
+            } else if kuttaType1 == -1 && kuttaType2 == 1 {
+                phi2 -= gamma;
+                dphi2 -= dgamma;
+            }
+        }
+
+        const dPhidl = (phi2 - phi1) * sd.invL_IJ_[face];
+        const ddPhidl = (dphi2 - dphi1) * sd.invL_IJ_[face];
+        const vDotT = uAvg * sd.t_IJ_x_[face] + vAvg * sd.t_IJ_y_[face];
+        const dvDotT = duAvg * sd.t_IJ_x_[face] + dvAvg * sd.t_IJ_y_[face];
+        const delta = vDotT - dPhidl;
+        const ddelta = dvDotT - ddPhidl;
+        const uFace = uAvg - delta * sd.corrCoeffX_[face];
+        const vFace = vAvg - delta * sd.corrCoeffY_[face];
+        const duFace = duAvg - ddelta * sd.corrCoeffX_[face];
+        const dvFace = dvAvg - ddelta * sd.corrCoeffY_[face];
+        const (rhoIsen, muFaceUnused, drhoIsen, dmuFaceUnused) =
+            computeDensityAndMuFromVelocityWithDerivative(sd, uFace, vFace, duFace, dvFace);
+
+        const nx = sd.faceNormalX_[face];
+        const ny = sd.faceNormalY_[face];
+        const vDotN = uFace * nx + vFace * ny;
+        const dvDotN = duFace * nx + dvFace * ny;
+
+        const (rho1Blend, mu1Blend, drho1Blend, dmu1Blend) =
+            computeRhoMuForElemOnFaceWithDerivative(sd, phiPtr, gammaPtr, face, elem1, seedCol, wrtGamma);
+        const (rho2Blend, mu2Blend, drho2Blend, dmu2Blend) =
+            computeRhoMuForElemOnFaceWithDerivative(sd, phiPtr, gammaPtr, face, elem2, seedCol, wrtGamma);
+        const upwindWeight = if vDotN >= 0.0 then 1.0 else 0.0;
+        const rhoUpwind = upwindWeight * rho1Blend + (1.0 - upwindWeight) * rho2Blend;
+        const muUpwind = upwindWeight * mu1Blend + (1.0 - upwindWeight) * mu2Blend;
+        const drhoUpwind = upwindWeight * drho1Blend + (1.0 - upwindWeight) * drho2Blend;
+        const dmuUpwind = upwindWeight * dmu1Blend + (1.0 - upwindWeight) * dmu2Blend;
+
+        var rhoFace = rhoIsen;
+        var drhoFace = drhoIsen;
+        if muUpwind > 0.0 {
+            rhoFace = rhoIsen - muUpwind * (rhoIsen - rhoUpwind);
+            drhoFace = (1.0 - muUpwind) * drhoIsen + muUpwind * drhoUpwind +
+                       (rhoUpwind - rhoIsen) * dmuUpwind;
+        }
+
+        dres += sign * sd.faceArea_[face] * (drhoFace * vDotN + rhoFace * dvDotN);
+    }
+
+    return dres * sd.res_scale_;
+}
+
+proc kuttaResidualForAD(sd: borrowed spatialDiscretization,
+                        phiPtr: c_ptr(real(64)),
+                        gammaPtr: c_ptr(real(64)),
+                        n: c_int): real(64) {
+    const gamma = gammaFromPtr(gammaPtr);
+    const upperElem = sd.upperTEelem_;
+    const lowerElem = sd.lowerTEelem_;
+    const (uUpper, vUpper) = computeVelocityForCellFromPtr(sd, phiPtr, gammaPtr, upperElem);
+    const (uLower, vLower) = computeVelocityForCellFromPtr(sd, phiPtr, gammaPtr, lowerElem);
+
+    const phiUpper = phiFromPtr(phiPtr, upperElem) +
+                     (uUpper * sd.deltaSupperTEx_ + vUpper * sd.deltaSupperTEy_);
+    const phiLower = phiFromPtr(phiPtr, lowerElem) +
+                     (uLower * sd.deltaSlowerTEx_ + vLower * sd.deltaSlowerTEy_);
+    const gammaComputed = phiUpper - phiLower;
+
+    return (gamma - gammaComputed) * sd.res_scale_;
+}
+
+proc kuttaResidualDerivativeAnalytical(sd: borrowed spatialDiscretization,
+                                               phiPtr: c_ptr(real(64)),
+                                               gammaPtr: c_ptr(real(64)),
+                                               seedCol: int,
+                                               wrtGamma: bool,
+                                               n: c_int): real(64) {
+    const dgamma = gammaSeedDerivative(wrtGamma);
+    const upperElem = sd.upperTEelem_;
+    const lowerElem = sd.lowerTEelem_;
+    const (uUpper, vUpper, duUpper, dvUpper) =
+        computeVelocityForCellFromPtrWithDerivative(sd, phiPtr, gammaPtr, upperElem, seedCol, wrtGamma);
+    const (uLower, vLower, duLower, dvLower) =
+        computeVelocityForCellFromPtrWithDerivative(sd, phiPtr, gammaPtr, lowerElem, seedCol, wrtGamma);
+
+    const dphiUpper = phiSeedDerivative(upperElem, seedCol, wrtGamma) +
+                      (duUpper * sd.deltaSupperTEx_ + dvUpper * sd.deltaSupperTEy_);
+    const dphiLower = phiSeedDerivative(lowerElem, seedCol, wrtGamma) +
+                      (duLower * sd.deltaSlowerTEx_ + dvLower * sd.deltaSlowerTEy_);
+
+    return (dgamma - (dphiUpper - dphiLower)) * sd.res_scale_;
+}
+
+proc solveConsistentGammaForPhi(sd: borrowed spatialDiscretization,
+                                        phiPtr: c_ptr(real(64)),
+                                        gammaInitial: real(64),
+                                        n: c_int,
+                                        maxIts: int = 12,
+                                        tol: real(64) = 1.0e-14): real(64) {
+    var gamma = gammaInitial;
+    for gammaIt in 1..maxIts {
+        const residual = kuttaResidualForAD(sd, phiPtr, c_ptrTo(gamma), n);
+        if abs(residual) < tol then
+            break;
+
+        const dgamma = kuttaResidualDerivativeAnalytical(sd, phiPtr, c_ptrTo(gamma), 0, true, n);
+        if abs(dgamma) < 1.0e-14 then
+            break;
+        gamma -= residual / dgamma;
+    }
+    return gamma;
+}
+
+proc findStencilIndex(stencil: [?D] int, col: int): int {
+    for idx in D do
+        if stencil[idx] == col then
+            return idx;
+    return -1;
+}
+
+proc accumulateCellVelocitySensitivityOnStencil(sd: borrowed spatialDiscretization,
+                                                        elem: int,
+                                                        stencil: [?D] int,
+                                                        ref du: [D] real(64),
+                                                        ref dv: [D] real(64),
+                                                        ref duGamma: real(64),
+                                                        ref dvGamma: real(64)) {
+    const elemIdx = findStencilIndex(stencil, elem);
+    const faceStart = sd.mesh_.elem2edgeIndex_[elem] + 1;
+    const faceEnd = sd.mesh_.elem2edgeIndex_[elem + 1];
+
+    for faceIdx in faceStart..faceEnd {
+        const face = sd.mesh_.elem2edge_[faceIdx];
+        const elem1 = sd.mesh_.edge2elem_[1, face];
+        const elem2 = sd.mesh_.edge2elem_[2, face];
+        const neighbor = if elem1 == elem then elem2 else elem1;
+
+        var wx, wy: real(64);
+        if elem == elem1 {
+            wx = sd.lsGradQR_!.wxFinal1_[face];
+            wy = sd.lsGradQR_!.wyFinal1_[face];
+        } else {
+            wx = sd.lsGradQR_!.wxFinal2_[face];
+            wy = sd.lsGradQR_!.wyFinal2_[face];
+        }
+
+        if neighbor <= sd.nelemDomain_ {
+            const neighborIdx = findStencilIndex(stencil, neighbor);
+            if neighborIdx >= 0 {
+                du[neighborIdx] += wx;
+                dv[neighborIdx] += wy;
+            }
+            if elemIdx >= 0 {
+                du[elemIdx] -= wx;
+                dv[elemIdx] -= wy;
+            }
+
+            const elemKuttaType = sd.kuttaCell_[elem];
+            const neighborKuttaType = sd.kuttaCell_[neighbor];
+            if elemKuttaType == 1 && neighborKuttaType == -1 {
+                duGamma += wx;
+                dvGamma += wy;
+            } else if elemKuttaType == -1 && neighborKuttaType == 1 {
+                duGamma -= wx;
+                dvGamma -= wy;
+            }
+        } else if !isWallFace(sd, face) {
+            if elemIdx >= 0 {
+                du[elemIdx] -= wx;
+                dv[elemIdx] -= wy;
+            }
+        }
+    }
+}
+
+proc accumulateDensityMuSensitivityFromVelocityOnStencil(sd: borrowed spatialDiscretization,
+                                                                 u: real(64),
+                                                                 v: real(64),
+                                                                 const ref du: [?D] real(64),
+                                                                 const ref dv: [D] real(64),
+                                                                 duGamma: real(64),
+                                                                 dvGamma: real(64),
+                                                                 ref drho: [D] real(64),
+                                                                 ref dmu: [D] real(64),
+                                                                 ref drhoGamma: real(64),
+                                                                 ref dmuGamma: real(64),
+                                                                 out rho: real(64),
+                                                                 out mu: real(64)) {
+    const machInf2 = sd.inputs_.MACH_ * sd.inputs_.MACH_;
+    const a = sd.gamma_minus_one_over_two_ * machInf2;
+    const B = 1.0 + a * (1.0 - u * u - v * v);
+    rho = B ** sd.one_over_gamma_minus_one_;
+    const rhoFactor = -2.0 * a * sd.one_over_gamma_minus_one_ *
+                      (B ** (sd.one_over_gamma_minus_one_ - 1.0));
+
+    for idx in D do
+        drho[idx] = rhoFactor * (u * du[idx] + v * dv[idx]);
+    drhoGamma = rhoFactor * (u * duGamma + v * dvGamma);
+
+    const vel2 = u * u + v * v;
+    const rhoPow = rho ** (1.0 - sd.inputs_.GAMMA_);
+    const M2 = machInf2 * vel2 * rhoPow;
+    const Mc2 = sd.inputs_.MACH_C_ * sd.inputs_.MACH_C_;
+    if M2 > Mc2 {
+        mu = sd.inputs_.MU_C_ * (M2 - Mc2);
+        const common = machInf2;
+        for idx in D {
+            const dM2 = common * rhoPow * (2.0 * u * du[idx] + 2.0 * v * dv[idx]) +
+                        common * vel2 * (1.0 - sd.inputs_.GAMMA_) *
+                        (rho ** (-sd.inputs_.GAMMA_)) * drho[idx];
+            dmu[idx] = sd.inputs_.MU_C_ * dM2;
+        }
+        const dM2Gamma = common * rhoPow * (2.0 * u * duGamma + 2.0 * v * dvGamma) +
+                         common * vel2 * (1.0 - sd.inputs_.GAMMA_) *
+                         (rho ** (-sd.inputs_.GAMMA_)) * drhoGamma;
+        dmuGamma = sd.inputs_.MU_C_ * dM2Gamma;
+    } else {
+        mu = 0.0;
+        dmu = 0.0;
+        dmuGamma = 0.0;
+    }
+}
+
+proc computeAnalyticalKuttaDerivativesOnStencil(sd: borrowed spatialDiscretization,
+                                                         stencil: [?D] int,
+                                                         ref kuttaDphi: [D] real(64),
+                                                         ref kuttaDgamma: real(64)) {
+    const upperElem = sd.upperTEelem_;
+    const lowerElem = sd.lowerTEelem_;
+    var duUpper: [D] real(64) = 0.0;
+    var dvUpper: [D] real(64) = 0.0;
+    var duLower: [D] real(64) = 0.0;
+    var dvLower: [D] real(64) = 0.0;
+    var duUpperGamma = 0.0;
+    var dvUpperGamma = 0.0;
+    var duLowerGamma = 0.0;
+    var dvLowerGamma = 0.0;
+
+    accumulateCellVelocitySensitivityOnStencil(sd, upperElem, stencil,
+                                               duUpper, dvUpper, duUpperGamma, dvUpperGamma);
+    accumulateCellVelocitySensitivityOnStencil(sd, lowerElem, stencil,
+                                               duLower, dvLower, duLowerGamma, dvLowerGamma);
+
+    const upperIdx = findStencilIndex(stencil, upperElem);
+    const lowerIdx = findStencilIndex(stencil, lowerElem);
+    if upperIdx >= 0 then
+        kuttaDphi[upperIdx] -= sd.res_scale_;
+    if lowerIdx >= 0 then
+        kuttaDphi[lowerIdx] += sd.res_scale_;
+
+    for idx in D {
+        kuttaDphi[idx] += sd.res_scale_ *
+                          (-sd.deltaSupperTEx_ * duUpper[idx] - sd.deltaSupperTEy_ * dvUpper[idx] +
+                            sd.deltaSlowerTEx_ * duLower[idx] + sd.deltaSlowerTEy_ * dvLower[idx]);
+    }
+
+    kuttaDgamma = sd.res_scale_ *
+                  (1.0 - sd.deltaSupperTEx_ * duUpperGamma - sd.deltaSupperTEy_ * dvUpperGamma +
+                   sd.deltaSlowerTEx_ * duLowerGamma + sd.deltaSlowerTEy_ * dvLowerGamma);
+}
 
 class temporalDiscretization {
     var spatialDisc_: shared spatialDiscretization;
@@ -22,9 +809,6 @@ class temporalDiscretization {
     var it_: int = 0;
     var t0_: real(64) = 0.0;
     var first_res_: real(64) = 1e12;
-    
-    // Index for circulation DOF (last row/column) - must be before A_petsc for init order
-    var gammaIndex_: int;
     
     var A_petsc : owned PETSCmatrix_c;
     var x_petsc : owned PETSCvector_c;
@@ -45,21 +829,41 @@ class temporalDiscretization {
     var dgradX_dGamma_: [gradSensitivity_dom] real(64);
     var dgradY_dGamma_: [gradSensitivity_dom] real(64);
     var Jij_: [gradSensitivity_dom] real(64);
+    var rowStencilOffsetDom: domain(1) = {1..0};
+    var rowStencilOffsets: [rowStencilOffsetDom] int;
+    var rowStencilDataDom: domain(1) = {0..<0};
+    var rowStencilData: [rowStencilDataDom] int;
+    var kuttaStencilCacheDom: domain(1) = {0..<0};
+    var kuttaStencilCache: [kuttaStencilCacheDom] int;
 
     proc init(spatialDisc: shared spatialDiscretization, ref inputs: potentialInputs) {
         writeln("Initializing temporal discretization...");
         this.spatialDisc_ = spatialDisc;
         this.inputs_ = inputs;
-        
-        const M = spatialDisc.nelemDomain_;
-        const N = spatialDisc.nelemDomain_;
+
+        const reducedExactSystem = isReducedExactJacobianType(this.inputs_.JACOBIAN_TYPE_);
+        const systemSize = spatialDisc.nelemDomain_;
+        const M = systemSize;
+        const N = systemSize;
         
         this.A_petsc = new owned PETSCmatrix_c(PETSC_COMM_SELF, "seqaij", M, M, N, N);
         this.x_petsc = new owned PETSCvector_c(PETSC_COMM_SELF, N, N, 0.0, "seq");
         this.b_petsc = new owned PETSCvector_c(PETSC_COMM_SELF, N, N, 0.0, "seq");
 
         var nnz : [0..M-1] PetscInt;
-        nnz = 4*(this.spatialDisc_.mesh_.elem2edge_[this.spatialDisc_.mesh_.elem2edgeIndex_[1] + 1 .. this.spatialDisc_.mesh_.elem2edgeIndex_[1 + 1]].size + 1);
+        const baseNNZ = 4 * (this.spatialDisc_.mesh_.elem2edge_[
+            this.spatialDisc_.mesh_.elem2edgeIndex_[1] + 1 ..
+            this.spatialDisc_.mesh_.elem2edgeIndex_[1 + 1]
+        ].size + 1);
+        if reducedExactSystem {
+            // The reduced phi-only exact Jacobian is a Schur complement:
+            // J_red = dR/dphi - dR/dGamma * (dK/dphi)/(dK/dGamma).
+            // Each row keeps its local stencil plus the Kutta row support, so
+            // it needs a noticeably wider preallocation than the standard local Jacobian.
+            nnz = max(64, baseNNZ + 16);
+        } else {
+            nnz = baseNNZ;
+        }
         A_petsc.preAllocate(nnz);
 
         this.ksp = new owned PETSCksp_c(PETSC_COMM_SELF, "gmres");
@@ -97,6 +901,21 @@ class temporalDiscretization {
     }
 
     proc initializeJacobian() {
+        if isReducedExactJacobianType(this.inputs_.JACOBIAN_TYPE_) {
+            const kuttaStencil = this.buildKuttaStencil();
+            for elem in 1..this.spatialDisc_.nelemDomain_ {
+                var stencilSet = new set(int);
+                const rowStencil = this.buildRowStencil(elem);
+                for col in rowStencil do stencilSet.add(col);
+                for col in kuttaStencil do stencilSet.add(col);
+                for col in stencilSet do
+                    this.A_petsc.set(elem - 1, col - 1, 0.0);
+            }
+
+            this.A_petsc.assemblyComplete();
+            return;
+        }
+
         forall elem in 1..this.spatialDisc_.nelemDomain_ {
             this.A_petsc.set(elem-1, elem-1, 0.0);
             const faces = this.spatialDisc_.mesh_.elem2edge_[this.spatialDisc_.mesh_.elem2edgeIndex_[elem] + 1 .. this.spatialDisc_.mesh_.elem2edgeIndex_[elem + 1]];
@@ -115,8 +934,6 @@ class temporalDiscretization {
                     isWakeFace = true;
                 }
             }
-            // Initialize dRes_i/dΓ column entries for wake-adjacent cells
-            // this.A_petsc.set(elem-1, this.gammaIndex_, 0.0);
             if isWakeFace {
                 const wakeFaceIndex = this.spatialDisc_.wakeFaceIndexInfluenceOnElem_[elem];
                 const upperTE_influences = this.spatialDisc_.wakeFaceUpper_[wakeFaceIndex];
@@ -131,376 +948,18 @@ class temporalDiscretization {
         // this.A_petsc.matView();
     }
 
-    proc computeGradientSensitivity() {
-        // Compute ∂(∇φ)/∂Γ for each cell.
-        // This captures how each cell's gradient depends on circulation through
-        // its wake-crossing faces.
-        //
-        // For cell I with gradient: ∇φ_I = Σ_k w_Ik * (φ_k_corrected - φ_I)
-        // where φ_k_corrected includes the Γ correction for wake-crossing neighbors:
-        //   - If I above (1), k below (-1): φ_k_corrected = φ_k + Γ
-        //   - If I below (-1), k above (1): φ_k_corrected = φ_k - Γ
-        //
-        // Therefore: ∂(∇φ_I)/∂Γ = Σ_{k: wake-crossing} w_Ik * (±1)
-
-        // Reset arrays
-        this.dgradX_dGamma_ = 0.0;
-        this.dgradY_dGamma_ = 0.0;
-
-        forall elem in 1..this.spatialDisc_.nelemDomain_ {
-            const kuttaType_elem = this.spatialDisc_.kuttaCell_[elem];
-
-            // Only cells in wake region (above=1 or below=-1) can have wake-crossing faces
-            if kuttaType_elem == 1 || kuttaType_elem == -1 {
-                const faces = this.spatialDisc_.mesh_.elem2edge_[
-                    this.spatialDisc_.mesh_.elem2edgeIndex_[elem] + 1 ..
-                    this.spatialDisc_.mesh_.elem2edgeIndex_[elem + 1]];
-
-                var dgx = 0.0, dgy = 0.0;
-
-                for face in faces {
-                    const elem1 = this.spatialDisc_.mesh_.edge2elem_[1, face];
-                    const elem2 = this.spatialDisc_.mesh_.edge2elem_[2, face];
-                    const neighbor = if elem1 == elem then elem2 else elem1;
-
-                    const kuttaType_neighbor = this.spatialDisc_.kuttaCell_[neighbor];
-
-                    // Check if this is a wake-crossing face
-                    const isWakeCrossing = (kuttaType_elem == 1 && kuttaType_neighbor == -1) ||
-                                           (kuttaType_elem == -1 && kuttaType_neighbor == 1);
-
-                    if isWakeCrossing {
-                        // Get weight from elem to neighbor
-                        var wx, wy: real(64);
-                        if elem == elem1 {
-                            wx = this.spatialDisc_.lsGradQR_!.wxFinal1_[face];
-                            wy = this.spatialDisc_.lsGradQR_!.wyFinal1_[face];
-                        } else {
-                            wx = this.spatialDisc_.lsGradQR_!.wxFinal2_[face];
-                            wy = this.spatialDisc_.lsGradQR_!.wyFinal2_[face];
-                        }
-
-                        // Sign: +1 if elem above, neighbor below (φ_neighbor + Γ)
-                        //       -1 if elem below, neighbor above (φ_neighbor - Γ)
-                        const gammaSgn = if kuttaType_elem == 1 then 1.0 else -1.0;
-
-                        dgx += wx * gammaSgn;
-                        dgy += wy * gammaSgn;
-                    }
-                }
-
-                this.dgradX_dGamma_[elem] = dgx;
-                this.dgradY_dGamma_[elem] = dgy;
-            }
-        }
-    }
-
     proc computeJacobian() {
-        // Compute the Jacobian matrix d(res_I)/d(phi_J) for the linear system.
-        //
-        // Residual: res_I = sum over faces f of elem I: sign_f * flux_f
-        //
-        // Flux with deferred correction (from spatialDiscretization.computeFluxes):
-        //   V_face = V_avg - delta * corrCoeff
-        //   where delta = V_avg · t - (phi_2 - phi_1) * invL
-        //   and corrCoeff = n / (n · t)
-        //
-        // Expanding V_face · n:
-        //   V_face · n = V_avg · n - delta * (corrCoeff · n)
-        //              = V_avg · n - (V_avg · t - dPhi/dL) * k
-        //   where k = 1/(n · t) = corrCoeff · n
-        //
-        //   = V_avg · (n - k*t) + k * invL * (phi_2 - phi_1)
-        //   = 0.5*(gradPhi_1 + gradPhi_2) · m + directCoeff * (phi_2 - phi_1)
-        //
-        // where m = n - k*t is the effective normal, and directCoeff = k * invL
-        //
-        // For WALL boundaries:
-        //   phi_ghost = phi_interior (Neumann BC)
-        //   V_ghost = V_int - 2*(V_int·n)*n (mirror velocity)
-        //   V_avg = V_int - (V_int·n)*n = V_int,tangent
-        //
-        // So V_avg · m = V_int · m - (V_int·n)*(n·m)
-        //              = V_int · [m - (n·m)*n]
-        // Define m_wall = m - (n·m)*n (tangential projection of effective normal)
-        //
-        // And the direct term: phi_ghost - phi_int = 0
-        //
-        // Derivatives:
-        //   gradPhi_I = sum_k w_Ik * (phi_k - phi_I)
-        //   d(gradPhi_I)/d(phi_I) = -sumW_I
-        //   d(gradPhi_I)/d(phi_k) = w_Ik
-
-        this.A_petsc.zeroEntries();
-        
-        forall elem in 1..this.spatialDisc_.nelemDomain_ {
-            const faces = this.spatialDisc_.mesh_.elem2edge_[
-                this.spatialDisc_.mesh_.elem2edgeIndex_[elem] + 1 .. 
-                this.spatialDisc_.mesh_.elem2edgeIndex_[elem + 1]];
-            
-            var diag = 0.0;  // Diagonal contribution d(res_elem)/d(phi_elem)
-            var dRes_dGamma = 0.0;  // Contribution d(res_elem)/d(Γ) for wake-crossing cells
-            
-            for face in faces {
-                const elem1 = this.spatialDisc_.mesh_.edge2elem_[1, face];
-                const elem2 = this.spatialDisc_.mesh_.edge2elem_[2, face];
-                const neighbor = if elem1 == elem then elem2 else elem1;
-                
-                // Sign: +1 if elem is elem1 (flux outward), -1 if elem is elem2
-                const sign = if elem1 == elem then 1.0 else -1.0;
-                
-                // Face geometry
-                const nx = this.spatialDisc_.faceNormalX_[face];
-                const ny = this.spatialDisc_.faceNormalY_[face];
-                const area = this.spatialDisc_.faceArea_[face];
-                const rhoFace = this.spatialDisc_.rhoFace_[face];
-                
-                // Get precomputed correction coefficients
-                const t_x = this.spatialDisc_.t_IJ_x_[face];
-                const t_y = this.spatialDisc_.t_IJ_y_[face];
-                const invL = this.spatialDisc_.invL_IJ_[face];
-                const nDotT = nx * t_x + ny * t_y;
-                const k = 1.0 / nDotT;
-                
-                // Effective normal: m = n - k*t (accounts for deferred correction)
-                const mx = nx - k * t_x;
-                const my = ny - k * t_y;
-                
-                // Direct phi coefficient: k * invL
-                const directCoeff = k * invL;
-                
-                // Get gradient weights for this element
-                const sumWx_elem = this.spatialDisc_.lsGradQR_!.sumWx_[elem];
-                const sumWy_elem = this.spatialDisc_.lsGradQR_!.sumWy_[elem];
-                var wx_elemToNeighbor: real(64);
-                var wy_elemToNeighbor: real(64);
-                var wx_neighborToElem: real(64);
-                var wy_neighborToElem: real(64);
-                var faceWeightElem: real(64);
-                var faceWeightNeighbor: real(64);
-                
-                if elem1 == elem {
-                    // elem is elem1, using weights from perspective 1
-                    wx_elemToNeighbor = this.spatialDisc_.lsGradQR_!.wxFinal1_[face];
-                    wy_elemToNeighbor = this.spatialDisc_.lsGradQR_!.wyFinal1_[face];
-                    wx_neighborToElem = this.spatialDisc_.lsGradQR_!.wxFinal2_[face];
-                    wy_neighborToElem = this.spatialDisc_.lsGradQR_!.wyFinal2_[face];
-                    faceWeightElem = this.spatialDisc_.weights1_[face];
-                    faceWeightNeighbor = this.spatialDisc_.weights2_[face];
-                } else {
-                    // elem is elem2, using weights from perspective 2
-                    wx_elemToNeighbor = this.spatialDisc_.lsGradQR_!.wxFinal2_[face];
-                    wy_elemToNeighbor = this.spatialDisc_.lsGradQR_!.wyFinal2_[face];
-                    wx_neighborToElem = this.spatialDisc_.lsGradQR_!.wxFinal1_[face];
-                    wy_neighborToElem = this.spatialDisc_.lsGradQR_!.wyFinal1_[face];
-                    faceWeightElem = this.spatialDisc_.weights2_[face];
-                    faceWeightNeighbor = this.spatialDisc_.weights1_[face];
-                }
-
-                // Check if this is a boundary face (neighbor is ghost cell)
-                const isInteriorFace = neighbor <= this.spatialDisc_.nelemDomain_;
-                const isWallFace = this.spatialDisc_.wallFaceSet_.contains(face);
-                
-                // Check if this face crosses the wake (Kutta condition)
-                // kuttaCell_ = 1 (above wake), -1 (below wake), 9 (elsewhere)
-                const kuttaType_elem = this.spatialDisc_.kuttaCell_[elem];
-                const kuttaType_neighbor = this.spatialDisc_.kuttaCell_[neighbor];
-                const isWakeCrossingFace = (kuttaType_elem == 1 && kuttaType_neighbor == -1) ||
-                                           (kuttaType_elem == -1 && kuttaType_neighbor == 1);
-                
-                if isInteriorFace {
-                    // === INTERIOR FACE ===
-                    // V_avg = 0.5*(V_elem + V_neighbor)
-                    // flux·n = 0.5*(gradPhi_elem + gradPhi_neighbor)·m + directCoeff*(phi_neighbor - phi_elem)
-                    
-                    // === DIAGONAL CONTRIBUTION ===
-                    // From d(0.5*(gradPhi_elem · m))/d(phi_elem) = 0.5 * (-sumW_elem · m)
-                    var face_diag = faceWeightElem * (-sumWx_elem * mx - sumWy_elem * my);
-                    
-                    // From d(0.5*(gradPhi_neighbor · m))/d(phi_elem) = 0.5 * (w_neighborToElem · m)
-                    face_diag += faceWeightNeighbor * (wx_neighborToElem * mx + wy_neighborToElem * my);
-                    
-                    // Apply sign and area to gradient terms
-                    const gradContrib = sign * face_diag * area * rhoFace;
-                    diag += gradContrib;
-                    
-                    // Direct phi term: d((phi_2 - phi_1) * directCoeff)/d(phi_elem)
-                    // For elem = elem1: d(phi2-phi1)/dphi1 = -1, sign=+1 → -directCoeff
-                    // For elem = elem2: d(phi2-phi1)/dphi2 = +1, sign=-1 → -directCoeff
-                    // Combined: always -directCoeff * ρ * A (no sign multiplication)
-                    const directContrib = -directCoeff * area * rhoFace;
-                    diag += directContrib;
-                    
-                    // === OFF-DIAGONAL CONTRIBUTION ===
-                    const sumWx_neighbor = this.spatialDisc_.lsGradQR_!.sumWx_[neighbor];
-                    const sumWy_neighbor = this.spatialDisc_.lsGradQR_!.sumWy_[neighbor];
-                    
-                    // From d(0.5*(gradPhi_elem · m))/d(phi_neighbor) = 0.5 * (w_elemToNeighbor · m)
-                    var offdiag = faceWeightElem * (wx_elemToNeighbor * mx + wy_elemToNeighbor * my);
-                    
-                    // From d(0.5*(gradPhi_neighbor · m))/d(phi_neighbor) = 0.5 * (-sumW_neighbor · m)
-                    offdiag += faceWeightNeighbor * (-sumWx_neighbor * mx - sumWy_neighbor * my);
-                    
-                    // Apply sign and area to gradient terms
-                    offdiag *= sign * area * rhoFace;
-                    
-                    // Direct phi term: d((phi_2 - phi_1) * directCoeff)/d(phi_neighbor)
-                    // For elem1's residual, neighbor=elem2, d(phi2-phi1)/dphi2 = +1
-                    // For elem2's residual, neighbor=elem1, d(phi2-phi1)/dphi1 = -1
-                    // With sign factor: sign * d(phi2-phi1)/dphi_neighbor
-                    //   elem is elem1: sign=+1, neighbor=elem2: d/dphi2 = +1 → contribution = +directCoeff
-                    //   elem is elem2: sign=-1, neighbor=elem1: d/dphi1 = -1 → contribution = +directCoeff
-                    // So regardless of which side elem is on, the direct contribution is +directCoeff
-                    // BUT wait - this doesn't match the diagonal analysis. Let me reconsider...
-                    //
-                    // Actually, for elem being elem1:
-                    //   R_elem1 = +1 * flux = ρ*(V·m)*A
-                    //   V·m includes directCoeff*(phi2-phi1)
-                    //   dR_elem1/dphi2 = +1 * ρ * A * (+directCoeff) = +ρ*A*directCoeff
-                    //
-                    // For elem being elem2:
-                    //   R_elem2 = -1 * flux = -ρ*(V·m)*A  
-                    //   dR_elem2/dphi1 = -1 * ρ * A * (-directCoeff) = +ρ*A*directCoeff
-                    //
-                    // So the direct term contributes +directCoeff*ρ*A to off-diagonal ALWAYS (no sign)
-                    offdiag += directCoeff * area * rhoFace;
-                    
-                    this.A_petsc.add(elem-1, neighbor-1, offdiag * this.spatialDisc_.res_scale_);
-
-                    // === CIRCULATION (Γ) DERIVATIVE ===
-                    // flux = 0.5 * (∇φ_elem + ∇φ_neighbor) · m + directCoeff * (φ_neighbor - φ_elem)
-                    // ∂flux/∂Γ = 0.5 * (∂∇φ_elem/∂Γ + ∂∇φ_neighbor/∂Γ) · m + ∂(direct)/∂Γ
-                    //
-                    // The gradient sensitivities are precomputed for ALL cells, capturing
-                    // contributions from ALL their wake-crossing faces (not just this face).
-                    // This ensures correct Jacobian even for faces that are not themselves
-                    // wake-crossing but whose cells have wake-crossing neighbors.
-
-                    // Contribution from elem's gradient sensitivity
-                    const dgradX_elem = this.dgradX_dGamma_[elem];
-                    const dgradY_elem = this.dgradY_dGamma_[elem];
-                    var dFlux_dGamma = faceWeightElem * (dgradX_elem * mx + dgradY_elem * my);
-
-                    // Contribution from neighbor's gradient sensitivity
-                    const dgradX_neighbor = this.dgradX_dGamma_[neighbor];
-                    const dgradY_neighbor = this.dgradY_dGamma_[neighbor];
-                    dFlux_dGamma += faceWeightNeighbor * (dgradX_neighbor * mx + dgradY_neighbor * my);
-
-                    // Apply sign and area
-                    dFlux_dGamma *= sign * area * rhoFace;
-
-                    // Direct term: only for wake-crossing faces
-                    // directCoeff * ((φ_neighbor ± Γ) - φ_elem)
-                    // ∂/∂Γ = ±directCoeff (sign depends on which side of wake)
-                    if isWakeCrossingFace {
-                        var gammaSgn = 0.0;
-                        if kuttaType_elem == 1 && kuttaType_neighbor == -1 {
-                            gammaSgn = 1.0;  // elem above, neighbor below: +Γ
-                        } else {
-                            gammaSgn = -1.0; // elem below, neighbor above: -Γ
-                        }
-                        dFlux_dGamma += directCoeff * area * rhoFace * gammaSgn;
-                    }
-
-                    dRes_dGamma += dFlux_dGamma;
-
-                } else if isWallFace {
-                    // === WALL BOUNDARY FACE ===
-                    // Wall BC: phi_ghost = phi_interior (Neumann)
-                    //          V_ghost = V_int - 2*(V_int·n)*n (mirror velocity)
-                    //
-                    // This gives: V_avg = V_int - (V_int·n)*n (tangential projection)
-                    // And: V_avg · m = V_int · m_wall, where m_wall = m - (n·m)*n
-                    //
-                    // The interior gradient includes ghost as neighbor:
-                    //   gradPhi_int = sum_k w_ik * (phi_k - phi_int)
-                    //   d(gradPhi_int)/d(phi_int) = -sumW_int + w_int_to_ghost * d(phi_ghost)/d(phi_int)
-                    //                             = -sumW_int + w_elemToNeighbor * 1
-                    //
-                    // So the diagonal contribution is:
-                    //   d(V_avg · m)/d(phi_int) = d(V_int · m_wall)/d(phi_int)
-                    //                          = (-sumW_int + w_elemToNeighbor) · m_wall
-                    
-                    // Compute m_wall = m - (n·m)*n (tangential projection of effective normal)
-                    const nDotM = nx * mx + ny * my;
-                    const mWallX = mx - nDotM * nx;
-                    const mWallY = my - nDotM * ny;
-                    
-                    // Diagonal contribution from d(gradPhi_elem)/d(phi_elem)
-                    // Note: includes correction for d(phi_ghost)/d(phi_int) = 1
-                    var face_diag = (-sumWx_elem + wx_elemToNeighbor) * mWallX 
-                                  + (-sumWy_elem + wy_elemToNeighbor) * mWallY;
-                    
-                    // Apply sign and area
-                    diag += sign * face_diag * area * rhoFace;
-
-                    // No direct phi term for wall since phi_ghost = phi_int → delta_phi = 0
-                    // No off-diagonal since ghost is not a real DOF
-
-                    // === CIRCULATION (Γ) DERIVATIVE FOR WALL FACES ===
-                    // Wall flux = V_int · m_wall * A, where V_int = ∇φ_int
-                    // If the interior cell has wake-crossing faces, ∇φ_int depends on Γ
-                    // ∂flux/∂Γ = (∂∇φ_int/∂Γ · m_wall) * A
-                    const dgradX_elem = this.dgradX_dGamma_[elem];
-                    const dgradY_elem = this.dgradY_dGamma_[elem];
-                    const dFlux_dGamma_wall = (dgradX_elem * mWallX + dgradY_elem * mWallY) * sign * area * rhoFace;
-                    dRes_dGamma += dFlux_dGamma_wall;
-
-                } else {
-                    // === FARFIELD BOUNDARY FACE ===
-                    // Farfield BC: phi_ghost = U_inf*x + V_inf*y (Dirichlet, fixed)
-                    //              V_ghost = 2*V_inf - V_int
-                    //
-                    // This gives: V_avg = V_inf (constant, no phi dependency)
-                    //
-                    // The interior gradient includes ghost as neighbor:
-                    //   gradPhi_int includes w_int_to_ghost * (phi_ghost - phi_int)
-                    //   d(gradPhi_int)/d(phi_int) = -sumW_int + w_int_to_ghost * 0 = -sumW_int
-                    //   (phi_ghost is fixed, so d(phi_ghost)/d(phi_int) = 0)
-                    //
-                    // However, the averaged velocity V_avg = V_inf is constant, so the flux
-                    // at farfield faces doesn't depend on interior phi through the gradient.
-                    // The only dependency is through the direct term.
-                    
-                    // Diagonal contribution from d(0.5*(gradPhi_elem · m))/d(phi_elem)
-                    // V_avg = V_inf is constant, but we still have the correction term
-                    // delta = V_avg · t - dPhi/dL, and dPhi = phi_ghost - phi_int
-                    // where phi_ghost is fixed
-                    
-                    // Actually for farfield, V_avg = V_inf (constant), so V_avg · m is constant
-                    // The only contribution is from the direct term: k*invL*(phi_ghost - phi_int)
-                    // d/d(phi_int) = -k*invL = -directCoeff
-                    
-                    // Apply sign and area for direct term only
-                    diag -= directCoeff * area * rhoFace;
-                }
-            }
-            
-            // Add diagonal entry
-            this.A_petsc.add(elem-1, elem-1, diag * this.spatialDisc_.res_scale_);
-            // We have computed dRes_elem/dΓ
-            // Now we compute dΓ/dphi and add to the appropriate column if needed
-            if dRes_dGamma != 0.0 {
-                const dGamma_dPhi_upper = 1.0; // dΓ/dφ_upperTE
-                const dGamma_dPhi_lower = -1.0; // dΓ/dφ_lowerTE
-                const dRes_dPhi_upper = dRes_dGamma * dGamma_dPhi_upper;
-                const dRes_dPhi_lower = dRes_dGamma * dGamma_dPhi_lower;
-
-                const wakeFaceIndex = this.spatialDisc_.wakeFaceIndexInfluenceOnElem_[elem];
-                const upperTE_influences = this.spatialDisc_.wakeFaceUpper_[wakeFaceIndex];
-                const lowerTE_influences = this.spatialDisc_.wakeFaceLower_[wakeFaceIndex];
-
-                this.A_petsc.add(elem-1, upperTE_influences - 1, dRes_dPhi_upper);
-                this.A_petsc.add(elem-1, lowerTE_influences - 1, dRes_dPhi_lower);
-
-                // writeln("elem ", elem, ": dRes/dGamma = ", dRes_dGamma, 
-                //         " → dRes/dφ_upperTE = ", dRes_dPhi_upper,
-                //         ", dRes/dφ_lowerTE = ", dRes_dPhi_lower);
-            }
+        // Dispatch to the selected Jacobian implementation so the solve loop
+        // stays separate from the assembly details.
+        if this.inputs_.JACOBIAN_TYPE_ == "ad_reduced_exact" {
+            this.computeADReducedExactJacobian();
+            return;
         }
-
-        this.A_petsc.assemblyComplete();
-        // this.A_petsc.matView();
+        if this.inputs_.JACOBIAN_TYPE_ == "analytical_reduced_exact" {
+            this.computeAnalyticalReducedExactJacobian();
+            return;
+        }
+        this.computeApproximateAnalyticalJacobian();
     }
 
     proc initialize() {
@@ -508,7 +967,12 @@ class temporalDiscretization {
         this.spatialDisc_.initializeKuttaCells();
         this.spatialDisc_.initializeSolution();
         this.spatialDisc_.run();
+        if isReducedExactJacobianType(this.inputs_.JACOBIAN_TYPE_) {
+            this.enforceConsistentGammaForCurrentPhi();
+            this.spatialDisc_.run();
+        }
         this.computeGradientSensitivity();
+        this.initializeStencilCache();
         this.initializeJacobian();
         
         this.computeJacobian();
@@ -529,14 +993,136 @@ class temporalDiscretization {
             this.t0_ = time.last;
             this.first_res_ = res.first;
         }
+
+        if CHECK_AD_ROW {
+            this.runADRowCheck();
+        }
+    }
+
+    proc buildRowStencilUncached(row: int) {
+        var stencilSet = new set(int);
+        var firstRing = new set(int);
+
+        stencilSet.add(row);
+        firstRing.add(row);
+
+        const rowNeighbors = this.spatialDisc_.mesh_.esuel_[
+            this.spatialDisc_.mesh_.esuelIndex_[row] + 1 ..
+            this.spatialDisc_.mesh_.esuelIndex_[row + 1]];
+        for neighbor in rowNeighbors {
+            if neighbor <= this.spatialDisc_.nelemDomain_ {
+                stencilSet.add(neighbor);
+                firstRing.add(neighbor);
+            }
+        }
+
+        for elem in firstRing {
+            const neighbors = this.spatialDisc_.mesh_.esuel_[
+                this.spatialDisc_.mesh_.esuelIndex_[elem] + 1 ..
+                this.spatialDisc_.mesh_.esuelIndex_[elem + 1]];
+            for neighbor in neighbors do
+                if neighbor <= this.spatialDisc_.nelemDomain_ then
+                    stencilSet.add(neighbor);
+        }
+
+        const wakeInfluence = this.spatialDisc_.wakeFaceIndexInfluenceOnElem_[row];
+        if wakeInfluence > 0 {
+            stencilSet.add(this.spatialDisc_.wakeFaceUpper_[wakeInfluence]);
+            stencilSet.add(this.spatialDisc_.wakeFaceLower_[wakeInfluence]);
+        }
+
+        const dom = {0..<stencilSet.size};
+        var stencil: [dom] int;
+        var idx = 0;
+        for elem in stencilSet {
+            stencil[idx] = elem;
+            idx += 1;
+        }
+        sort(stencil);
+        return stencil;
+    }
+
+    proc buildRowStencil(row: int) {
+        if this.rowStencilOffsets.size > 0 {
+            const start = this.rowStencilOffsets[row];
+            const stop = this.rowStencilOffsets[row + 1];
+            const dom = {0..<(stop - start)};
+            var stencil: [dom] int;
+            if stop > start then
+                stencil = this.rowStencilData[start..<stop];
+            return stencil;
+        }
+
+        return this.buildRowStencilUncached(row);
+    }
+
+    proc buildKuttaStencilUncached() {
+        var stencilSet = new set(int);
+        const upperStencil = this.buildRowStencilUncached(this.spatialDisc_.upperTEelem_);
+        const lowerStencil = this.buildRowStencilUncached(this.spatialDisc_.lowerTEelem_);
+
+        for col in upperStencil do stencilSet.add(col);
+        for col in lowerStencil do stencilSet.add(col);
+
+        const dom = {0..<stencilSet.size};
+        var stencil: [dom] int;
+        var idx = 0;
+        for elem in stencilSet {
+            stencil[idx] = elem;
+            idx += 1;
+        }
+        sort(stencil);
+        return stencil;
+    }
+
+    proc buildKuttaStencil() {
+        if this.kuttaStencilCache.size > 0 {
+            const dom = {0..<this.kuttaStencilCache.size};
+            var stencil: [dom] int = this.kuttaStencilCache;
+            return stencil;
+        }
+
+        return this.buildKuttaStencilUncached();
+    }
+
+    proc initializeStencilCache() {
+        const nelem = this.spatialDisc_.nelemDomain_;
+        this.rowStencilOffsetDom = {1..nelem + 1};
+        this.rowStencilOffsets = 0;
+
+        var totalSize = 0;
+        for row in 1..nelem {
+            this.rowStencilOffsets[row] = totalSize;
+            totalSize += this.buildRowStencilUncached(row).size;
+        }
+        this.rowStencilOffsets[nelem + 1] = totalSize;
+
+        this.rowStencilDataDom = {0..<totalSize};
+        this.rowStencilData = 0;
+        for row in 1..nelem {
+            const stencil = this.buildRowStencilUncached(row);
+            const start = this.rowStencilOffsets[row];
+            for idx in stencil.domain do
+                this.rowStencilData[start + idx] = stencil[idx];
+        }
+
+        const kuttaStencil = this.buildKuttaStencilUncached();
+        this.kuttaStencilCacheDom = {0..<kuttaStencil.size};
+        this.kuttaStencilCache = kuttaStencil;
     }
 
     proc solve() {
+        if CHECK_AD_ROW && AD_ROW_CHECK_ONLY {
+            writeln("AD row check requested; skipping nonlinear solve.");
+            return;
+        }
+
         var normalized_res: real(64) = 1e12;
         var res : real(64) = 1e12;        // Current residual (absolute)
         var res_prev : real(64) = 1e12;  // Previous iteration residual for line search
         var omega : real(64) = this.inputs_.OMEGA_;  // Current relaxation factor
         var time: stopwatch;
+        const sufficientDecrease = this.inputs_.SUFFICIENT_DECREASE_;
 
         // Initial residual
         res = RMSE(this.spatialDisc_.res_, this.spatialDisc_.elemVolume_);
@@ -566,6 +1152,8 @@ class temporalDiscretization {
         while ((normalized_res > this.inputs_.CONV_TOL_ && res > this.inputs_.CONV_ATOL_) && this.it_ < this.inputs_.IT_MAX_ && isNan(normalized_res) == false) {
             this.it_ += 1;
             time.start();
+            const reducedExactMode = isReducedExactJacobianType(this.inputs_.JACOBIAN_TYPE_);
+            res_prev = res;
 
             this.computeJacobian();
             
@@ -585,26 +1173,80 @@ class temporalDiscretization {
             
             var lineSearchIts = 0;
             omega = this.inputs_.OMEGA_;
-            
-            // === NO LINE SEARCH - fixed omega ===
-            forall elem in 1..this.spatialDisc_.nelemDomain_ {
-                this.spatialDisc_.phi_[elem] += omega * this.x_petsc.get(elem-1);
-            }
-            const phi_upper = this.spatialDisc_.phi_[this.spatialDisc_.upperTEelem_] + (this.spatialDisc_.uu_[this.spatialDisc_.upperTEelem_] * this.spatialDisc_.deltaSupperTEx_ + this.spatialDisc_.vv_[this.spatialDisc_.upperTEelem_] * this.spatialDisc_.deltaSupperTEy_);
-            const phi_lower = this.spatialDisc_.phi_[this.spatialDisc_.lowerTEelem_] + (this.spatialDisc_.uu_[this.spatialDisc_.lowerTEelem_] * this.spatialDisc_.deltaSlowerTEx_ + this.spatialDisc_.vv_[this.spatialDisc_.lowerTEelem_] * this.spatialDisc_.deltaSlowerTEy_);
-            const gamma_computed = phi_upper - phi_lower;
-            this.spatialDisc_.circulation_ = gamma_computed;
-            
-            // Compute residual for convergence check
-            this.spatialDisc_.run();
-            res = RMSE(this.spatialDisc_.res_, this.spatialDisc_.elemVolume_);
-            
-            res_prev = res;
-            normalized_res = res / this.first_res_;
 
-            if normalized_res < this.inputs_.FREEZE_MU_TOL_ {
-                this.spatialDisc_.FREEZE_MU_ = true;
+            const phiDom = {1..this.spatialDisc_.nelemDomain_};
+            var phiSaved: [phiDom] real(64);
+            var phiBest: [phiDom] real(64);
+            forall elem in phiDom {
+                phiSaved[elem] = this.spatialDisc_.phi_[elem];
+                phiBest[elem] = this.spatialDisc_.phi_[elem];
             }
+            const gammaSaved = this.spatialDisc_.circulation_;
+            var gammaBest = gammaSaved;
+            var bestRes = max(real(64));
+            var accepted = false;
+            const maxLineSearch = if this.inputs_.LINE_SEARCH_ then max(0, this.inputs_.MAX_LINE_SEARCH_) else 0;
+
+            for ls in 0..maxLineSearch {
+                lineSearchIts = ls;
+                if ls > 0 then
+                    omega *= 0.5;
+
+                forall elem in phiDom do
+                    this.spatialDisc_.phi_[elem] = phiSaved[elem] + omega * this.x_petsc.get(elem-1);
+                this.spatialDisc_.circulation_ = gammaSaved;
+
+                if reducedExactMode {
+                    this.enforceConsistentGammaForCurrentPhi();
+                } else {
+                    const phi_upper = this.spatialDisc_.phi_[this.spatialDisc_.upperTEelem_] +
+                                      (this.spatialDisc_.uu_[this.spatialDisc_.upperTEelem_] * this.spatialDisc_.deltaSupperTEx_ +
+                                       this.spatialDisc_.vv_[this.spatialDisc_.upperTEelem_] * this.spatialDisc_.deltaSupperTEy_);
+                    const phi_lower = this.spatialDisc_.phi_[this.spatialDisc_.lowerTEelem_] +
+                                      (this.spatialDisc_.uu_[this.spatialDisc_.lowerTEelem_] * this.spatialDisc_.deltaSlowerTEx_ +
+                                       this.spatialDisc_.vv_[this.spatialDisc_.lowerTEelem_] * this.spatialDisc_.deltaSlowerTEy_);
+                    const gamma_computed = phi_upper - phi_lower;
+                    this.spatialDisc_.circulation_ = gamma_computed;
+                }
+
+                this.spatialDisc_.run();
+                const trialRes = RMSE(this.spatialDisc_.res_, this.spatialDisc_.elemVolume_);
+
+                if !isNan(trialRes) && trialRes < bestRes {
+                    bestRes = trialRes;
+                    gammaBest = this.spatialDisc_.circulation_;
+                    forall elem in phiDom do
+                        phiBest[elem] = this.spatialDisc_.phi_[elem];
+                }
+
+                const acceptTrial = !this.inputs_.LINE_SEARCH_ ||
+                                    (!isNan(trialRes) &&
+                                     trialRes <= sufficientDecrease * res_prev);
+                if acceptTrial {
+                    res = trialRes;
+                    accepted = true;
+                    break;
+                }
+            }
+
+            if !accepted {
+                if bestRes < max(real(64)) {
+                    forall elem in phiDom do
+                        this.spatialDisc_.phi_[elem] = phiBest[elem];
+                    this.spatialDisc_.circulation_ = gammaBest;
+                    this.spatialDisc_.run();
+                    res = bestRes;
+                } else {
+                    forall elem in phiDom do
+                        this.spatialDisc_.phi_[elem] = phiSaved[elem];
+                    this.spatialDisc_.circulation_ = gammaSaved;
+                    this.spatialDisc_.run();
+                    res = res_prev;
+                    omega = 0.0;
+                }
+            }
+
+            normalized_res = res / this.first_res_;
 
             const res_wall = RMSE(this.spatialDisc_.res_[this.spatialDisc_.wall_dom], this.spatialDisc_.elemVolume_[this.spatialDisc_.wall_dom]);
             const res_farfield = RMSE(this.spatialDisc_.res_[this.spatialDisc_.farfield_dom], this.spatialDisc_.elemVolume_[this.spatialDisc_.farfield_dom]);
@@ -620,7 +1262,7 @@ class temporalDiscretization {
                     " res: ", res, " norm res: ", normalized_res, " kutta res: ", this.spatialDisc_.kutta_res_,
                     " res wall: ", res_wall, " res farfield: ", res_farfield, " res fluid: ", res_fluid, " res wake: ", res_wake, " res shock: ", res_shock,
                     " Cl: ", Cl, " Cd: ", Cd, " Cm: ", Cm, " Circulation: ", this.spatialDisc_.circulation_,
-                    " GMRES its: ", its, " reason: ", reason, " omega: ", omega);
+                    " GMRES its: ", its, " reason: ", reason, " omega: ", omega, " ls its: ", lineSearchIts);
 
             this.timeList_.pushBack(elapsed);
             this.itList_.pushBack(this.it_);

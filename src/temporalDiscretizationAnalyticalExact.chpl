@@ -1,0 +1,290 @@
+module temporalDiscretizationAnalyticalExact {
+use temporalDiscretization;
+use List;
+use Set;
+
+// Hand-coded reduced exact Jacobian assembly.
+
+proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
+    this.A_petsc.zeroEntries();
+
+    const sd = this.spatialDisc_.borrow();
+    const kuttaStencil = this.buildKuttaStencil();
+    const kuttaDom = {0..<kuttaStencil.size};
+    var kuttaDphi: [kuttaDom] real(64) = 0.0;
+    var kuttaDgamma = 0.0;
+    computeAnalyticalKuttaDerivativesOnStencil(sd, kuttaStencil, kuttaDphi, kuttaDgamma);
+
+    if abs(kuttaDgamma) < 1.0e-14 then
+        halt("Analytical reduced exact Jacobian failed: dR_gamma/dGamma is too small");
+
+    const rows = 1..this.spatialDisc_.nelemDomain_;
+    var rowCols: [rows] list(int);
+    var rowVals: [rows] list(real(64));
+
+    forall row in rows with (ref rowCols, ref rowVals) {
+        const rowStencil = this.buildRowStencil(row);
+        const rowDom = {0..<rowStencil.size};
+        var rowDphi: [rowDom] real(64) = 0.0;
+        var rowDgamma = 0.0;
+        var du1: [rowDom] real(64) = 0.0;
+        var dv1: [rowDom] real(64) = 0.0;
+        var du2: [rowDom] real(64) = 0.0;
+        var dv2: [rowDom] real(64) = 0.0;
+        var duAvg: [rowDom] real(64) = 0.0;
+        var dvAvg: [rowDom] real(64) = 0.0;
+        var dDeltaPhi: [rowDom] real(64) = 0.0;
+        var duFaceCoeff: [rowDom] real(64) = 0.0;
+        var dvFaceCoeff: [rowDom] real(64) = 0.0;
+        var drhoIsen: [rowDom] real(64) = 0.0;
+        var drho1Blend: [rowDom] real(64) = 0.0;
+        var dmu1Blend: [rowDom] real(64) = 0.0;
+        var drho2Blend: [rowDom] real(64) = 0.0;
+        var dmu2Blend: [rowDom] real(64) = 0.0;
+        var drhoFace: [rowDom] real(64) = 0.0;
+        var duTmp: [rowDom] real(64) = 0.0;
+        var dvTmp: [rowDom] real(64) = 0.0;
+        const faces = this.spatialDisc_.mesh_.elem2edge_[
+            this.spatialDisc_.mesh_.elem2edgeIndex_[row] + 1 ..
+            this.spatialDisc_.mesh_.elem2edgeIndex_[row + 1]];
+
+        for face in faces {
+            const elem1 = this.spatialDisc_.mesh_.edge2elem_[1, face];
+            const elem2 = this.spatialDisc_.mesh_.edge2elem_[2, face];
+            const sign = if elem1 == row then 1.0 else -1.0;
+            const nx = this.spatialDisc_.faceNormalX_[face];
+            const ny = this.spatialDisc_.faceNormalY_[face];
+            const area = this.spatialDisc_.faceArea_[face];
+            const qFace = this.spatialDisc_.uFace_[face] * nx + this.spatialDisc_.vFace_[face] * ny;
+            const rhoFace = this.spatialDisc_.rhoFace_[face];
+            const rhoIsen = this.spatialDisc_.rhoIsenFace_[face];
+            const uFace = this.spatialDisc_.uFace_[face];
+            const vFace = this.spatialDisc_.vFace_[face];
+            du1 = 0.0;
+            dv1 = 0.0;
+            du2 = 0.0;
+            dv2 = 0.0;
+            var du1Gamma = 0.0;
+            var dv1Gamma = 0.0;
+            var du2Gamma = 0.0;
+            var dv2Gamma = 0.0;
+
+            if elem1 <= sd.nelemDomain_ {
+                accumulateCellVelocitySensitivityOnStencil(sd, elem1, rowStencil,
+                                                           du1, dv1, du1Gamma, dv1Gamma);
+            } else if isWallFace(sd, face) {
+                accumulateCellVelocitySensitivityOnStencil(sd, elem2, rowStencil,
+                                                           du1, dv1, du1Gamma, dv1Gamma);
+                for idx in rowDom {
+                    const dvDotN = du1[idx] * nx + dv1[idx] * ny;
+                    du1[idx] = du1[idx] - 2.0 * dvDotN * nx;
+                    dv1[idx] = dv1[idx] - 2.0 * dvDotN * ny;
+                }
+                const dvDotNGamma = du1Gamma * nx + dv1Gamma * ny;
+                du1Gamma = du1Gamma - 2.0 * dvDotNGamma * nx;
+                dv1Gamma = dv1Gamma - 2.0 * dvDotNGamma * ny;
+            }
+
+            if elem2 <= sd.nelemDomain_ {
+                accumulateCellVelocitySensitivityOnStencil(sd, elem2, rowStencil,
+                                                           du2, dv2, du2Gamma, dv2Gamma);
+            } else if isWallFace(sd, face) {
+                accumulateCellVelocitySensitivityOnStencil(sd, elem1, rowStencil,
+                                                           du2, dv2, du2Gamma, dv2Gamma);
+                for idx in rowDom {
+                    const dvDotN = du2[idx] * nx + dv2[idx] * ny;
+                    du2[idx] = du2[idx] - 2.0 * dvDotN * nx;
+                    dv2[idx] = dv2[idx] - 2.0 * dvDotN * ny;
+                }
+                const dvDotNGamma = du2Gamma * nx + dv2Gamma * ny;
+                du2Gamma = du2Gamma - 2.0 * dvDotNGamma * nx;
+                dv2Gamma = dv2Gamma - 2.0 * dvDotNGamma * ny;
+            }
+
+            const weight1 = sd.weights1_[face];
+            const weight2 = sd.weights2_[face];
+            duAvg = 0.0;
+            dvAvg = 0.0;
+            for idx in rowDom {
+                duAvg[idx] = weight1 * du1[idx] + weight2 * du2[idx];
+                dvAvg[idx] = weight1 * dv1[idx] + weight2 * dv2[idx];
+            }
+            const duAvgGamma = weight1 * du1Gamma + weight2 * du2Gamma;
+            const dvAvgGamma = weight1 * dv1Gamma + weight2 * dv2Gamma;
+
+            dDeltaPhi = 0.0;
+            var dDeltaPhiGamma = 0.0;
+            if elem1 <= sd.nelemDomain_ && elem2 <= sd.nelemDomain_ {
+                const kuttaType1 = sd.kuttaCell_[elem1];
+                const kuttaType2 = sd.kuttaCell_[elem2];
+                if kuttaType1 == 1 && kuttaType2 == -1 then
+                    dDeltaPhiGamma = 1.0;
+                else if kuttaType1 == -1 && kuttaType2 == 1 then
+                    dDeltaPhiGamma = -1.0;
+            }
+            const idxMinus = if elem1 <= sd.nelemDomain_ then
+                                 findStencilIndex(rowStencil, elem1)
+                             else if isWallFace(sd, face) then
+                                 findStencilIndex(rowStencil, elem2)
+                             else
+                                 -1;
+            const idxPlus = if elem2 <= sd.nelemDomain_ then
+                                findStencilIndex(rowStencil, elem2)
+                            else if isWallFace(sd, face) then
+                                findStencilIndex(rowStencil, elem1)
+                            else
+                                -1;
+            if idxMinus >= 0 then dDeltaPhi[idxMinus] -= 1.0;
+            if idxPlus >= 0 then dDeltaPhi[idxPlus] += 1.0;
+
+            duFaceCoeff = 0.0;
+            dvFaceCoeff = 0.0;
+            for idx in rowDom {
+                const ddelta = duAvg[idx] * sd.t_IJ_x_[face] + dvAvg[idx] * sd.t_IJ_y_[face] -
+                               dDeltaPhi[idx] * sd.invL_IJ_[face];
+                duFaceCoeff[idx] = duAvg[idx] - ddelta * sd.corrCoeffX_[face];
+                dvFaceCoeff[idx] = dvAvg[idx] - ddelta * sd.corrCoeffY_[face];
+            }
+            const ddeltaGamma = duAvgGamma * sd.t_IJ_x_[face] + dvAvgGamma * sd.t_IJ_y_[face] -
+                                dDeltaPhiGamma * sd.invL_IJ_[face];
+            const duFaceGamma = duAvgGamma - ddeltaGamma * sd.corrCoeffX_[face];
+            const dvFaceGamma = dvAvgGamma - ddeltaGamma * sd.corrCoeffY_[face];
+
+            const machInf2 = sd.inputs_.MACH_ * sd.inputs_.MACH_;
+            const a = sd.gamma_minus_one_over_two_ * machInf2;
+            const BFace = 1.0 + a * (1.0 - uFace * uFace - vFace * vFace);
+            const rhoFaceFactor = -2.0 * a * sd.one_over_gamma_minus_one_ *
+                                  (BFace ** (sd.one_over_gamma_minus_one_ - 1.0));
+            drhoIsen = 0.0;
+            for idx in rowDom do
+                drhoIsen[idx] = rhoFaceFactor * (uFace * duFaceCoeff[idx] + vFace * dvFaceCoeff[idx]);
+            const drhoIsenGamma = rhoFaceFactor * (uFace * duFaceGamma + vFace * dvFaceGamma);
+
+            var rho1Blend, mu1Blend, rho2Blend, mu2Blend: real(64);
+            drho1Blend = 0.0;
+            dmu1Blend = 0.0;
+            drho2Blend = 0.0;
+            dmu2Blend = 0.0;
+            var drho1BlendGamma, dmu1BlendGamma, drho2BlendGamma, dmu2BlendGamma: real(64);
+
+            if elem1 <= sd.nelemDomain_ {
+                rho1Blend = sd.rhorho_[elem1];
+                mu1Blend = sd.mumu_[elem1];
+                accumulateDensityMuSensitivityFromVelocityOnStencil(sd, sd.uu_[elem1], sd.vv_[elem1],
+                                                                    du1, dv1, du1Gamma, dv1Gamma,
+                                                                    drho1Blend, dmu1Blend,
+                                                                    drho1BlendGamma, dmu1BlendGamma,
+                                                                    rho1Blend, mu1Blend);
+            } else if isWallFace(sd, face) {
+                rho1Blend = sd.rhorho_[elem2];
+                mu1Blend = sd.mumu_[elem2];
+                duTmp = 0.0;
+                dvTmp = 0.0;
+                var duTmpGamma = 0.0;
+                var dvTmpGamma = 0.0;
+                accumulateCellVelocitySensitivityOnStencil(sd, elem2, rowStencil,
+                                                           duTmp, dvTmp, duTmpGamma, dvTmpGamma);
+                accumulateDensityMuSensitivityFromVelocityOnStencil(sd, sd.uu_[elem2], sd.vv_[elem2],
+                                                                    duTmp, dvTmp, duTmpGamma, dvTmpGamma,
+                                                                    drho1Blend, dmu1Blend,
+                                                                    drho1BlendGamma, dmu1BlendGamma,
+                                                                    rho1Blend, mu1Blend);
+            } else {
+                rho1Blend = 0.0;
+                mu1Blend = 0.0;
+                drho1Blend = 0.0;
+                dmu1Blend = 0.0;
+                drho1BlendGamma = 0.0;
+                dmu1BlendGamma = 0.0;
+            }
+
+            if elem2 <= sd.nelemDomain_ {
+                rho2Blend = sd.rhorho_[elem2];
+                mu2Blend = sd.mumu_[elem2];
+                accumulateDensityMuSensitivityFromVelocityOnStencil(sd, sd.uu_[elem2], sd.vv_[elem2],
+                                                                    du2, dv2, du2Gamma, dv2Gamma,
+                                                                    drho2Blend, dmu2Blend,
+                                                                    drho2BlendGamma, dmu2BlendGamma,
+                                                                    rho2Blend, mu2Blend);
+            } else if isWallFace(sd, face) {
+                rho2Blend = sd.rhorho_[elem1];
+                mu2Blend = sd.mumu_[elem1];
+                duTmp = 0.0;
+                dvTmp = 0.0;
+                var duTmpGamma = 0.0;
+                var dvTmpGamma = 0.0;
+                accumulateCellVelocitySensitivityOnStencil(sd, elem1, rowStencil,
+                                                           duTmp, dvTmp, duTmpGamma, dvTmpGamma);
+                accumulateDensityMuSensitivityFromVelocityOnStencil(sd, sd.uu_[elem1], sd.vv_[elem1],
+                                                                    duTmp, dvTmp, duTmpGamma, dvTmpGamma,
+                                                                    drho2Blend, dmu2Blend,
+                                                                    drho2BlendGamma, dmu2BlendGamma,
+                                                                    rho2Blend, mu2Blend);
+            } else {
+                rho2Blend = 0.0;
+                mu2Blend = 0.0;
+                drho2Blend = 0.0;
+                dmu2Blend = 0.0;
+                drho2BlendGamma = 0.0;
+                dmu2BlendGamma = 0.0;
+            }
+
+            const useElem1Upwind = qFace >= 0.0;
+            const rhoUpwind = if useElem1Upwind then rho1Blend else rho2Blend;
+            const muUpwind = if useElem1Upwind then mu1Blend else mu2Blend;
+            const drhoUpwindGamma = if useElem1Upwind then drho1BlendGamma else drho2BlendGamma;
+            const dmuUpwindGamma = if useElem1Upwind then dmu1BlendGamma else dmu2BlendGamma;
+
+            drhoFace = 0.0;
+            var drhoFaceGamma = drhoIsenGamma;
+            if muUpwind > 0.0 {
+                for idx in rowDom {
+                    const drhoUpwind = if useElem1Upwind then drho1Blend[idx] else drho2Blend[idx];
+                    const dmuUpwind = if useElem1Upwind then dmu1Blend[idx] else dmu2Blend[idx];
+                    drhoFace[idx] = (1.0 - muUpwind) * drhoIsen[idx] + muUpwind * drhoUpwind +
+                                    (rhoUpwind - rhoIsen) * dmuUpwind;
+                }
+                drhoFaceGamma = (1.0 - muUpwind) * drhoIsenGamma + muUpwind * drhoUpwindGamma +
+                                (rhoUpwind - rhoIsen) * dmuUpwindGamma;
+            } else {
+                drhoFace = drhoIsen;
+            }
+
+            for idx in rowDom {
+                const dq = duFaceCoeff[idx] * nx + dvFaceCoeff[idx] * ny;
+                rowDphi[idx] += sign * area * (drhoFace[idx] * qFace + rhoFace * dq) * sd.res_scale_;
+            }
+            const dqGamma = duFaceGamma * nx + dvFaceGamma * ny;
+            rowDgamma += sign * area * (drhoFaceGamma * qFace + rhoFace * dqGamma) * sd.res_scale_;
+        }
+
+        var stencilSet = new set(int);
+        for col in rowStencil do stencilSet.add(col);
+        for col in kuttaStencil do stencilSet.add(col);
+
+        for col in stencilSet {
+            const rowIdx = findStencilIndex(rowStencil, col);
+            const kuttaIdx = findStencilIndex(kuttaStencil, col);
+            const rowValue = if rowIdx >= 0 then rowDphi[rowIdx] else 0.0;
+            const kuttaValue = if kuttaIdx >= 0 then kuttaDphi[kuttaIdx] else 0.0;
+            const reducedValue = rowValue - (rowDgamma / kuttaDgamma) * kuttaValue;
+            if abs(reducedValue) > AD_ROW_PRINT_TOL || col == row {
+                rowCols[row].pushBack(col);
+                rowVals[row].pushBack(reducedValue);
+            }
+        }
+    }
+
+    if AD_JACOBIAN_PROGRESS_FREQ > 0 {
+        writeln("Analytical reduced exact Jacobian assembly completed in parallel for ",
+                this.spatialDisc_.nelemDomain_, " rows");
+    }
+
+    for row in rows {
+        for (col, val) in zip(rowCols[row], rowVals[row]) do
+            this.A_petsc.add(row - 1, col - 1, val);
+    }
+
+    this.A_petsc.assemblyComplete();
+}
+}

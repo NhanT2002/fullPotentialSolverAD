@@ -1,9 +1,13 @@
 # Compiler
 CHPL ?= chpl
+CHPL_LLVM_BIN ?= /home/user/chapel-2.5.0/third-party/llvm/install/linux64-x86_64/bin
+OPT ?= $(CHPL_LLVM_BIN)/opt
+LLVM_AS ?= $(CHPL_LLVM_BIN)/llvm-as
 
 # Directories
 SRC_DIR := src
 BIN_DIR := bin
+BUILD_DIR := build
 
 # Program name (without .chpl)
 PROGRAM := main
@@ -11,6 +15,8 @@ PROGRAM := main
 # Source and target
 SRC := $(wildcard $(SRC_DIR)/*.chpl)
 TARGET := $(BIN_DIR)/$(PROGRAM)
+CHPL_BC := $(BUILD_DIR)/chpl__module-opt1.bc
+CHPL_LL := $(BUILD_DIR)/chpl__module-opt1.ll
 
 # Default rule
 all: $(TARGET)
@@ -48,18 +54,31 @@ PETSCDIR_INCLUDE := $(PETSC_DIR)/include petscksp.h petsc.h petscmat.h
 
 ALL_INCLUDES := $(addprefix -I,$(filter-out ,$(INCLUDE_DIRS)))
 ALL_LIBS := $(MKL_LIB) $(HDF5_LIB) $(CGNS_LIB) $(METIS_LIB) $(PETSC_LIB) $(SLEPC_LIB) $(MPI_LIB)
+CHPL_FLAGS := -M$(CGNS_MOD_DIR) -M$(CGNS_MOD_DIR_SRC) -M$(COMMON_MOD_DIR) $(ALL_INCLUDES) $(ALL_LIBS) --set blasImpl=off --local --fast
+
+ENZYME_DIR ?= /home/user/Enzyme/enzyme/build-llvm19/Enzyme
+ENZYME_PLUGIN ?= $(firstword $(sort $(wildcard $(ENZYME_DIR)/LLVMEnzyme*.so)))
 
 # Compile Chapel program
-$(TARGET): $(SRC) | $(BIN_DIR)
-	$(CHPL) -M$(CGNS_MOD_DIR) -M$(CGNS_MOD_DIR_SRC) -M$(COMMON_MOD_DIR) $(ALL_INCLUDES) $(ALL_LIBS) $(SRC) -o $(TARGET) --set blasImpl=off --local --fast
+$(TARGET): $(SRC) | $(BIN_DIR) $(BUILD_DIR)
+	test -n "$(ENZYME_PLUGIN)"
+	test -f "$(ENZYME_PLUGIN)"
+	$(CHPL) $(CHPL_FLAGS) --driver-compilation-phase --driver-tmp-dir $(BUILD_DIR) $(SRC)
+	$(OPT) $(CHPL_BC) -load-pass-plugin=$(ENZYME_PLUGIN) -passes=enzyme -o $(CHPL_LL) -S
+	$(OPT) $(CHPL_LL) -O2 -o $(CHPL_LL) -S
+	$(LLVM_AS) $(CHPL_LL) -o $(CHPL_BC)
+	$(CHPL) $(CHPL_FLAGS) --driver-makebinary-phase --driver-tmp-dir $(BUILD_DIR) $(SRC) -o $(TARGET)
 
 # Create bin directory if it does not exist
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
 
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
 # Clean target
 clean:
-	rm -f $(TARGET)
+	rm -rf $(TARGET) $(BUILD_DIR)
 
 # Phony targets
 .PHONY: all clean

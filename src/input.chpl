@@ -24,7 +24,6 @@ config const OMEGA : real(64); // Relaxation factor for the iterative solver
 config const IT_MAX : int;
 config const CONV_TOL : real(64);
 config const CONV_ATOL : real(64) = 1e-15;  // Absolute convergence tolerance for residual
-config const FREEZE_MU_TOL : real(64) = 1e-6; // Residual tolerance to freeze MU adaptation
 config const X_REF : real(64);
 config const Y_REF : real(64);
 config const MU_C : real(64);
@@ -66,7 +65,7 @@ config const GMRES_MAXIT : int;
 config const GMRES_RESTART : int;
 config const GMRES_PRECON : string;
 config const GMRES_PRECON_SIDE : string = "right";  // Preconditioning side: "left" or "right"
-config const JACOBIAN_TYPE : string = "analytical";  // Jacobian type: "analytical" or "numerical"
+config const JACOBIAN_TYPE : string = "analytical";  // Jacobian type: "analytical", "numerical", "ad_reduced_exact", or "analytical_reduced_exact"
 config const USE_NATIVE_GMRES : bool = false;  // Use Chapel-native GMRES instead of PETSc
 
 // Adaptive (Inexact) Newton parameters - Eisenstat-Walker forcing terms
@@ -116,7 +115,6 @@ record potentialInputs {
     var IT_MAX_: int = IT_MAX;
     var CONV_TOL_ : real(64) = CONV_TOL;
     var CONV_ATOL_ : real(64) = CONV_ATOL;  // Absolute convergence tolerance
-    var FREEZE_MU_TOL_ : real(64) = FREEZE_MU_TOL; // Residual tolerance to freeze MU adaptation
     
     var RHO_INF_: real(64) = 1.0;
     var VEL_INF_: real(64) = 1.0;

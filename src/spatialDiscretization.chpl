@@ -115,7 +115,7 @@ class spatialDiscretization {
     var shock_dom: sparse subdomain(elemDomain_dom); // cells next to shock
     var wallFaceSet_: set(int);  // Set of wall face indices for efficient lookup
 
-    var FREEZE_MU_: bool = false;
+    var farfieldIsCylinder_: bool = false;
 
     proc init(Mesh: shared MeshData, ref inputs: potentialInputs) {
         this.mesh_ = Mesh;
@@ -133,11 +133,13 @@ class spatialDiscretization {
         this.gamma_minus_one_over_two_ = (this.inputs_.GAMMA_ - 1.0) / 2.0;
         this.one_minus_gamma_over_two_ = (1.0 - this.inputs_.GAMMA_) / 2.0;
         this.one_over_gamma_minus_one_ = 1.0 / (this.inputs_.GAMMA_ - 1.0);
+        this.farfieldIsCylinder_ = this.inputs_.FARFIELD_BC_TYPE_ == "cylinder";
     }
 
     // Update the inputs record (used for Mach continuation)
     proc updateInputs(ref newInputs: potentialInputs) {
         this.inputs_ = newInputs;
+        this.farfieldIsCylinder_ = this.inputs_.FARFIELD_BC_TYPE_ == "cylinder";
     }
 
     proc initializeMetrics() {
@@ -733,14 +735,13 @@ class spatialDiscretization {
                                  (1.0 - this.uu_[elem] * this.uu_[elem] - this.vv_[elem] * this.vv_[elem])) ** this.one_over_gamma_minus_one_;
             this.machmach_[elem] = this.mach(this.uu_[elem], this.vv_[elem], this.rhorho_[elem]);
             
-            if this.FREEZE_MU_ == false {
-                // Linear switching function:
-                // μ = μ_C * max(0, M² - M_C²)
-                // Properties: μ = 0 for M ≤ M_C, μ grows unboundedly with M² (sharper shock)
-                const M2 = this.machmach_[elem] * this.machmach_[elem];
-                const Mc2 = this.inputs_.MACH_C_ * this.inputs_.MACH_C_;
-                this.mumu_[elem] = this.inputs_.MU_C_ * max(0.0, M2 - Mc2);
-            }
+            // Linear switching function:
+            // μ = μ_C * max(0, M² - M_C²)
+            // Properties: μ = 0 for M ≤ M_C, μ grows unboundedly with M² (sharper shock)
+            const M2 = this.machmach_[elem] * this.machmach_[elem];
+            const Mc2 = this.inputs_.MACH_C_ * this.inputs_.MACH_C_;
+            const excessMach2 = max(0.0, M2 - Mc2);
+            this.mumu_[elem] = this.inputs_.MU_C_ * excessMach2;
         }
 
         // forall elem in 1..this.nelemDomain_ {
@@ -880,6 +881,7 @@ class spatialDiscretization {
             const uFace = this.uFace_[face];
             const vFace = this.vFace_[face];
             const vDotN = uFace * nx + vFace * ny;
+            const upwindWeight = if vDotN >= 0.0 then 1.0 else 0.0;
             
             // Upwind/downwind elements based on flow direction (store for Jacobian reuse)
             if vDotN >= 0.0 {
@@ -890,10 +892,9 @@ class spatialDiscretization {
                 this.downwindElem_[face] = elem1;
             }
             const upwindElem = this.upwindElem_[face];
-            const downwindElem = this.downwindElem_[face];
             
             // Cell-centered switching function from upwind cell
-            const mu = this.mumu_[upwindElem];
+            const mu = upwindWeight * this.mumu_[elem1] + (1.0 - upwindWeight) * this.mumu_[elem2];
             
             // Skip if switching function is zero (subsonic region)
             if mu <= 0.0 then continue;
@@ -902,7 +903,7 @@ class spatialDiscretization {
             // Simplified: no gradient extrapolation for Jacobian consistency
             // this.rhoFace_[face] = this.rhoNonIsentropic(this.rhoFace_[face], this.machmach_[upwindElem]);
             const rhoIsentropic = this.rhoFace_[face];
-            const rhoUpwind = this.rhorho_[upwindElem];
+            const rhoUpwind = upwindWeight * this.rhorho_[elem1] + (1.0 - upwindWeight) * this.rhorho_[elem2];
             
             // Blend: ρ_face = ρ_isen - μ * (ρ_isen - ρ_upwind)
             this.rhoFace_[face] = rhoIsentropic - mu * (rhoIsentropic - rhoUpwind);

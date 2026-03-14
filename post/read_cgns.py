@@ -74,9 +74,9 @@ def readHSPM(filename) :
             'Y_wall': y,
             'Cp_wall': cp}
 
-data = readCGNS("../output/output_14.cgns")
-data2 = readCGNS("../output/output_15.cgns")
-data3 = readCGNS("../output/output_19.cgns")
+data = readCGNS("../output/output_82.cgns")
+data2 = readCGNS("../output/output_82.cgns")
+data3 = readCGNS("../output/output_83.cgns")
 
 
 plt.figure()
