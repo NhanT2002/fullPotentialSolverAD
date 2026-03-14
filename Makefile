@@ -16,16 +16,26 @@ TARGET := $(BIN_DIR)/$(PROGRAM)
 all: $(TARGET)
 
 # Module
-CGNS_MOD_DIR := /apps/partage-elns/1_NhanT/1_CHAMPS_DEV/champs/EXT_LIBS
-CGNS_MOD_DIR_SRC := /apps/partage-elns/1_NhanT/1_CHAMPS_DEV/champs/EXT_LIBS/src
-COMMON_MOD_DIR := /apps/partage-elns/1_NhanT/1_CHAMPS_DEV/champs/common/src
+CGNS_MOD_DIR := /home/user/test/fullPotentialSolver/champs/EXT_LIBS
+CGNS_MOD_DIR_SRC := /home/user/test/fullPotentialSolver/champs/EXT_LIBS/src
+COMMON_MOD_DIR := /home/user/test/fullPotentialSolver/champs/common/src
+
+# PETSc was built against its own MPICH install. If PETSc exposes an install
+# prefix, use that for MPI instead of a conflicting system MPIROOT.
+PETSC_PREFIX := $(strip $(shell sed -n 's/^prefix=//p' $(PETSCROOT)/lib/pkgconfig/PETSc.pc 2>/dev/null))
+ifneq ($(PETSC_PREFIX),)
+MPIROOT := $(PETSC_PREFIX)
+endif
+
+MPI_LIB_DIR := $(if $(wildcard $(MPIROOT)/lib/release),$(MPIROOT)/lib/release,$(MPIROOT)/lib)
+INCLUDE_DIRS := $(HDF5ROOT)/include $(MKLROOT)/include $(CGNSROOT)/include $(METISROOT)/include $(PETSCROOT)/include $(PETSC_DIR)/include $(SLEPCROOT_INCLUDE) $(SLEPCDIR_INCLUDE) $(MPIROOT)/include
 
 
 HDF5_LIB := -L$(HDF5ROOT)/lib -lhdf5
 CGNS_LIB := -L$(CGNSROOT)/lib -lcgns -lhdf5
 MKL_LIB := -L$(MKLROOT)/lib/intel64 -lmkl_rt -lmkl_intel_lp64 -lmkl_intel_thread -lmkl_core -liomp5
 METIS_LIB := -L$(METISROOT)/lib -lmetis
-MPI_LIB := -L$(MPIROOT)/lib/release -lmpi
+MPI_LIB := -L$(MPI_LIB_DIR) -lmpi
 PETSC_LIB := -L$(PETSCROOT)/lib -lpetsc
 
 HDF5_INCLUDE := $(HDF5ROOT)/include hdf5.h
@@ -36,9 +46,8 @@ MPI_INCLUDE := $(MPIROOT)/include mpi.h
 PETSCROOT_INCLUDE := $(PETSCROOT)/include petscksp.h petsc.h petscmat.h
 PETSCDIR_INCLUDE := $(PETSC_DIR)/include petscksp.h petsc.h petscmat.h
 
-ALL_INCLUDES := -I$(HDF5_INCLUDE) -I$(MKL_INCLUDE) -I$(CGNS_INCLUDE) -I$(METIS_INCLUDE) -I$(PETSCROOT_INCLUDE) -I$(PETSCDIR_INCLUDE) -I$(SLEPCROOT_INCLUDE) -I$(SLEPCDIR_INCLUDE) -I$(MPI_INCLUDE)
+ALL_INCLUDES := $(addprefix -I,$(filter-out ,$(INCLUDE_DIRS)))
 ALL_LIBS := $(MKL_LIB) $(HDF5_LIB) $(CGNS_LIB) $(METIS_LIB) $(PETSC_LIB) $(SLEPC_LIB) $(MPI_LIB)
-
 
 # Compile Chapel program
 $(TARGET): $(SRC) | $(BIN_DIR)

@@ -12,11 +12,16 @@ use C_PETSC;
 use petsc;
 use CTypes;
 use List;
+use gmres;
+use Sort;
+use IO;
 
 class temporalDiscretization {
     var spatialDisc_: shared spatialDiscretization;
     var inputs_: potentialInputs;
     var it_: int = 0;
+    var t0_: real(64) = 0.0;
+    var first_res_: real(64) = 1e12;
     
     // Index for circulation DOF (last row/column) - must be before A_petsc for init order
     var gammaIndex_: int;
@@ -39,16 +44,15 @@ class temporalDiscretization {
     var gradSensitivity_dom: domain(1) = {1..0};
     var dgradX_dGamma_: [gradSensitivity_dom] real(64);
     var dgradY_dGamma_: [gradSensitivity_dom] real(64);
+    var Jij_: [gradSensitivity_dom] real(64);
 
     proc init(spatialDisc: shared spatialDiscretization, ref inputs: potentialInputs) {
         writeln("Initializing temporal discretization...");
         this.spatialDisc_ = spatialDisc;
         this.inputs_ = inputs;
-
-        // Add 1 extra DOF for circulation Γ
-        const M = spatialDisc.nelemDomain_ + 1;
-        const N = spatialDisc.nelemDomain_ + 1;
-        this.gammaIndex_ = spatialDisc.nelemDomain_;  // 0-based index for Γ
+        
+        const M = spatialDisc.nelemDomain_;
+        const N = spatialDisc.nelemDomain_;
         
         this.A_petsc = new owned PETSCmatrix_c(PETSC_COMM_SELF, "seqaij", M, M, N, N);
         this.x_petsc = new owned PETSCvector_c(PETSC_COMM_SELF, N, N, 0.0, "seq");
@@ -56,8 +60,6 @@ class temporalDiscretization {
 
         var nnz : [0..M-1] PetscInt;
         nnz = 4*(this.spatialDisc_.mesh_.elem2edge_[this.spatialDisc_.mesh_.elem2edgeIndex_[1] + 1 .. this.spatialDisc_.mesh_.elem2edgeIndex_[1 + 1]].size + 1);
-        // Γ row has connections to TE cells only
-        nnz[M-1] = 5;
         A_petsc.preAllocate(nnz);
 
         this.ksp = new owned PETSCksp_c(PETSC_COMM_SELF, "gmres");
@@ -89,7 +91,7 @@ class temporalDiscretization {
             writeln("No preconditioner for GMRES");
             this.ksp.setPreconditioner("none");
         }
-
+        
         // Initialize gradient sensitivity arrays
         this.gradSensitivity_dom = {1..spatialDisc.nelemDomain_};
     }
@@ -98,25 +100,32 @@ class temporalDiscretization {
         forall elem in 1..this.spatialDisc_.nelemDomain_ {
             this.A_petsc.set(elem-1, elem-1, 0.0);
             const faces = this.spatialDisc_.mesh_.elem2edge_[this.spatialDisc_.mesh_.elem2edgeIndex_[elem] + 1 .. this.spatialDisc_.mesh_.elem2edgeIndex_[elem + 1]];
+            var isWakeFace = false;
             for face in faces {
                 const elem1 = this.spatialDisc_.mesh_.edge2elem_[1, face];
                 const elem2 = this.spatialDisc_.mesh_.edge2elem_[2, face];
                 const neighbor = if elem1 == elem then elem2 else elem1;
                 if neighbor <= this.spatialDisc_.nelemDomain_ {
                     this.A_petsc.set(elem-1, neighbor-1, 0.0);
+                    if this.dgradX_dGamma_[neighbor] != 0.0 || this.dgradY_dGamma_[neighbor] != 0.0 {
+                        isWakeFace = true;
+                    }
+                }
+                if this.dgradX_dGamma_[elem] != 0.0 || this.dgradY_dGamma_[elem] != 0.0 {
+                    isWakeFace = true;
                 }
             }
             // Initialize dRes_i/dΓ column entries for wake-adjacent cells
-            this.A_petsc.set(elem-1, this.gammaIndex_, 0.0);
+            // this.A_petsc.set(elem-1, this.gammaIndex_, 0.0);
+            if isWakeFace {
+                const wakeFaceIndex = this.spatialDisc_.wakeFaceIndexInfluenceOnElem_[elem];
+                const upperTE_influences = this.spatialDisc_.wakeFaceUpper_[wakeFaceIndex];
+                const lowerTE_influences = this.spatialDisc_.wakeFaceLower_[wakeFaceIndex];
+
+                this.A_petsc.set(elem-1, upperTE_influences - 1, 0.0);
+                this.A_petsc.set(elem-1, lowerTE_influences - 1, 0.0);
+            }
         }
-        
-        // Initialize Γ row (Kutta condition): Γ - (φ_upper - φ_lower) = 0
-        // dKutta/dΓ = 1
-        this.A_petsc.set(this.gammaIndex_, this.gammaIndex_, 0.0);
-        // dKutta/dφ_upperTE = -1
-        this.A_petsc.set(this.gammaIndex_, this.spatialDisc_.upperTEelem_ - 1, 0.0);
-        // dKutta/dφ_lowerTE = +1
-        this.A_petsc.set(this.gammaIndex_, this.spatialDisc_.lowerTEelem_ - 1, 0.0);
 
         this.A_petsc.assemblyComplete();
         // this.A_petsc.matView();
@@ -184,21 +193,6 @@ class temporalDiscretization {
                 this.dgradY_dGamma_[elem] = dgy;
             }
         }
-
-        // // Debug: count cells with non-zero gradient sensitivity
-        // if this.it_ == 1 {
-        //     var count = 0;
-        //     var maxDgx = 0.0, maxDgy = 0.0;
-        //     for elem in 1..this.spatialDisc_.nelemDomain_ {
-        //         if this.dgradX_dGamma_[elem] != 0.0 || this.dgradY_dGamma_[elem] != 0.0 {
-        //             count += 1;
-        //             if abs(this.dgradX_dGamma_[elem]) > maxDgx then maxDgx = abs(this.dgradX_dGamma_[elem]);
-        //             if abs(this.dgradY_dGamma_[elem]) > maxDgy then maxDgy = abs(this.dgradY_dGamma_[elem]);
-        //         }
-        //     }
-        //     writeln("DEBUG: Cells with non-zero grad sensitivity: ", count,
-        //             " max|dgradX|: ", maxDgx, " max|dgradY|: ", maxDgy);
-        // }
     }
 
     proc computeJacobian() {
@@ -282,6 +276,8 @@ class temporalDiscretization {
                 var wy_elemToNeighbor: real(64);
                 var wx_neighborToElem: real(64);
                 var wy_neighborToElem: real(64);
+                var faceWeightElem: real(64);
+                var faceWeightNeighbor: real(64);
                 
                 if elem1 == elem {
                     // elem is elem1, using weights from perspective 1
@@ -289,14 +285,18 @@ class temporalDiscretization {
                     wy_elemToNeighbor = this.spatialDisc_.lsGradQR_!.wyFinal1_[face];
                     wx_neighborToElem = this.spatialDisc_.lsGradQR_!.wxFinal2_[face];
                     wy_neighborToElem = this.spatialDisc_.lsGradQR_!.wyFinal2_[face];
+                    faceWeightElem = this.spatialDisc_.weights1_[face];
+                    faceWeightNeighbor = this.spatialDisc_.weights2_[face];
                 } else {
                     // elem is elem2, using weights from perspective 2
                     wx_elemToNeighbor = this.spatialDisc_.lsGradQR_!.wxFinal2_[face];
                     wy_elemToNeighbor = this.spatialDisc_.lsGradQR_!.wyFinal2_[face];
                     wx_neighborToElem = this.spatialDisc_.lsGradQR_!.wxFinal1_[face];
                     wy_neighborToElem = this.spatialDisc_.lsGradQR_!.wyFinal1_[face];
+                    faceWeightElem = this.spatialDisc_.weights2_[face];
+                    faceWeightNeighbor = this.spatialDisc_.weights1_[face];
                 }
-                
+
                 // Check if this is a boundary face (neighbor is ghost cell)
                 const isInteriorFace = neighbor <= this.spatialDisc_.nelemDomain_;
                 const isWallFace = this.spatialDisc_.wallFaceSet_.contains(face);
@@ -315,34 +315,57 @@ class temporalDiscretization {
                     
                     // === DIAGONAL CONTRIBUTION ===
                     // From d(0.5*(gradPhi_elem · m))/d(phi_elem) = 0.5 * (-sumW_elem · m)
-                    var face_diag = 0.5 * (-sumWx_elem * mx - sumWy_elem * my);
+                    var face_diag = faceWeightElem * (-sumWx_elem * mx - sumWy_elem * my);
                     
                     // From d(0.5*(gradPhi_neighbor · m))/d(phi_elem) = 0.5 * (w_neighborToElem · m)
-                    face_diag += 0.5 * (wx_neighborToElem * mx + wy_neighborToElem * my);
+                    face_diag += faceWeightNeighbor * (wx_neighborToElem * mx + wy_neighborToElem * my);
                     
                     // Apply sign and area to gradient terms
-                    diag += sign * face_diag * area * rhoFace;
+                    const gradContrib = sign * face_diag * area * rhoFace;
+                    diag += gradContrib;
                     
                     // Direct phi term: d((phi_2 - phi_1) * directCoeff)/d(phi_elem)
-                    diag -= directCoeff * area * rhoFace;
+                    // For elem = elem1: d(phi2-phi1)/dphi1 = -1, sign=+1 → -directCoeff
+                    // For elem = elem2: d(phi2-phi1)/dphi2 = +1, sign=-1 → -directCoeff
+                    // Combined: always -directCoeff * ρ * A (no sign multiplication)
+                    const directContrib = -directCoeff * area * rhoFace;
+                    diag += directContrib;
                     
                     // === OFF-DIAGONAL CONTRIBUTION ===
                     const sumWx_neighbor = this.spatialDisc_.lsGradQR_!.sumWx_[neighbor];
                     const sumWy_neighbor = this.spatialDisc_.lsGradQR_!.sumWy_[neighbor];
                     
                     // From d(0.5*(gradPhi_elem · m))/d(phi_neighbor) = 0.5 * (w_elemToNeighbor · m)
-                    var offdiag = 0.5 * (wx_elemToNeighbor * mx + wy_elemToNeighbor * my);
+                    var offdiag = faceWeightElem * (wx_elemToNeighbor * mx + wy_elemToNeighbor * my);
                     
                     // From d(0.5*(gradPhi_neighbor · m))/d(phi_neighbor) = 0.5 * (-sumW_neighbor · m)
-                    offdiag += 0.5 * (-sumWx_neighbor * mx - sumWy_neighbor * my);
+                    offdiag += faceWeightNeighbor * (-sumWx_neighbor * mx - sumWy_neighbor * my);
                     
                     // Apply sign and area to gradient terms
                     offdiag *= sign * area * rhoFace;
                     
-                    // Direct phi term
+                    // Direct phi term: d((phi_2 - phi_1) * directCoeff)/d(phi_neighbor)
+                    // For elem1's residual, neighbor=elem2, d(phi2-phi1)/dphi2 = +1
+                    // For elem2's residual, neighbor=elem1, d(phi2-phi1)/dphi1 = -1
+                    // With sign factor: sign * d(phi2-phi1)/dphi_neighbor
+                    //   elem is elem1: sign=+1, neighbor=elem2: d/dphi2 = +1 → contribution = +directCoeff
+                    //   elem is elem2: sign=-1, neighbor=elem1: d/dphi1 = -1 → contribution = +directCoeff
+                    // So regardless of which side elem is on, the direct contribution is +directCoeff
+                    // BUT wait - this doesn't match the diagonal analysis. Let me reconsider...
+                    //
+                    // Actually, for elem being elem1:
+                    //   R_elem1 = +1 * flux = ρ*(V·m)*A
+                    //   V·m includes directCoeff*(phi2-phi1)
+                    //   dR_elem1/dphi2 = +1 * ρ * A * (+directCoeff) = +ρ*A*directCoeff
+                    //
+                    // For elem being elem2:
+                    //   R_elem2 = -1 * flux = -ρ*(V·m)*A  
+                    //   dR_elem2/dphi1 = -1 * ρ * A * (-directCoeff) = +ρ*A*directCoeff
+                    //
+                    // So the direct term contributes +directCoeff*ρ*A to off-diagonal ALWAYS (no sign)
                     offdiag += directCoeff * area * rhoFace;
                     
-                    this.A_petsc.add(elem-1, neighbor-1, offdiag);
+                    this.A_petsc.add(elem-1, neighbor-1, offdiag * this.spatialDisc_.res_scale_);
 
                     // === CIRCULATION (Γ) DERIVATIVE ===
                     // flux = 0.5 * (∇φ_elem + ∇φ_neighbor) · m + directCoeff * (φ_neighbor - φ_elem)
@@ -356,12 +379,12 @@ class temporalDiscretization {
                     // Contribution from elem's gradient sensitivity
                     const dgradX_elem = this.dgradX_dGamma_[elem];
                     const dgradY_elem = this.dgradY_dGamma_[elem];
-                    var dFlux_dGamma = 0.5 * (dgradX_elem * mx + dgradY_elem * my);
+                    var dFlux_dGamma = faceWeightElem * (dgradX_elem * mx + dgradY_elem * my);
 
                     // Contribution from neighbor's gradient sensitivity
                     const dgradX_neighbor = this.dgradX_dGamma_[neighbor];
                     const dgradY_neighbor = this.dgradY_dGamma_[neighbor];
-                    dFlux_dGamma += 0.5 * (dgradX_neighbor * mx + dgradY_neighbor * my);
+                    dFlux_dGamma += faceWeightNeighbor * (dgradX_neighbor * mx + dgradY_neighbor * my);
 
                     // Apply sign and area
                     dFlux_dGamma *= sign * area * rhoFace;
@@ -376,7 +399,7 @@ class temporalDiscretization {
                         } else {
                             gammaSgn = -1.0; // elem below, neighbor above: -Γ
                         }
-                        dFlux_dGamma += directCoeff * area * gammaSgn * rhoFace;
+                        dFlux_dGamma += directCoeff * area * rhoFace * gammaSgn;
                     }
 
                     dRes_dGamma += dFlux_dGamma;
@@ -454,33 +477,28 @@ class temporalDiscretization {
             }
             
             // Add diagonal entry
-            this.A_petsc.add(elem-1, elem-1, diag);
-            
-            // Add dRes/dΓ entry (column for circulation)
-            this.A_petsc.add(elem-1, this.gammaIndex_, dRes_dGamma);
-        }
-        
-        // === KUTTA CONDITION ROW ===
-        // Γ - (φ_upper,TE - φ_lower,TE) = 0
-        // Currently, circulation is computed as:
-        //   Γ = φ_upper + V_upper·Δs - [φ_lower + V_lower·Δs]
-        //
-        // Kutta residual: R_Γ = Γ - (φ_upperTE - φ_lowerTE)
-        // φ_upperTE = φ_upper + V_upper·Δs
-        // φ_lowerTE = φ_lower + V_lower·Δs
+            this.A_petsc.add(elem-1, elem-1, diag * this.spatialDisc_.res_scale_);
+            // We have computed dRes_elem/dΓ
+            // Now we compute dΓ/dphi and add to the appropriate column if needed
+            if dRes_dGamma != 0.0 {
+                const dGamma_dPhi_upper = 1.0; // dΓ/dφ_upperTE
+                const dGamma_dPhi_lower = -1.0; // dΓ/dφ_lowerTE
+                const dRes_dPhi_upper = dRes_dGamma * dGamma_dPhi_upper;
+                const dRes_dPhi_lower = dRes_dGamma * dGamma_dPhi_lower;
 
-        // d(R_Γ)/dΓ = 1
-        // d(R_Γ)/dφ_upperTE = -1 - d(V_upper·Δs)/dφ_upperTE 
-        // d(R_Γ)/dφ_lowerTE = +1 + d(V_lower·Δs)/dφ_lowerTE
-        
-        // dKutta/dΓ = 1
-        this.A_petsc.add(this.gammaIndex_, this.gammaIndex_, 1.0);
-        
-        // dKutta/dφ_upperTE1 = -1.0
-        this.A_petsc.add(this.gammaIndex_, this.spatialDisc_.upperTEelem_ - 1, -1.0);
-        // dKutta/dφ_lowerTE1 = +1.0
-        this.A_petsc.add(this.gammaIndex_, this.spatialDisc_.lowerTEelem_ - 1, 1.0);
-        
+                const wakeFaceIndex = this.spatialDisc_.wakeFaceIndexInfluenceOnElem_[elem];
+                const upperTE_influences = this.spatialDisc_.wakeFaceUpper_[wakeFaceIndex];
+                const lowerTE_influences = this.spatialDisc_.wakeFaceLower_[wakeFaceIndex];
+
+                this.A_petsc.add(elem-1, upperTE_influences - 1, dRes_dPhi_upper);
+                this.A_petsc.add(elem-1, lowerTE_influences - 1, dRes_dPhi_lower);
+
+                // writeln("elem ", elem, ": dRes/dGamma = ", dRes_dGamma, 
+                //         " → dRes/dφ_upperTE = ", dRes_dPhi_upper,
+                //         ", dRes/dφ_lowerTE = ", dRes_dPhi_lower);
+            }
+        }
+
         this.A_petsc.assemblyComplete();
         // this.A_petsc.matView();
     }
@@ -489,56 +507,120 @@ class temporalDiscretization {
         this.spatialDisc_.initializeMetrics();
         this.spatialDisc_.initializeKuttaCells();
         this.spatialDisc_.initializeSolution();
-        this.initializeJacobian();
+        this.spatialDisc_.run();
         this.computeGradientSensitivity();
+        this.initializeJacobian();
+        
         this.computeJacobian();
+
+        if this.inputs_.START_FILENAME_ != "" {
+            writeln("Initializing solution from file: ", this.inputs_.START_FILENAME_);
+            const (xElem, yElem, rho, phi, it, time, res, cl, cd, cm, circulation, wakeGamma) = readSolution(this.inputs_.START_FILENAME_);
+            for i in it.domain {
+                this.timeList_.pushBack(time[i]);
+                this.itList_.pushBack(it[i]);
+                this.resList_.pushBack(res[i]);
+                this.clList_.pushBack(cl[i]);
+                this.cdList_.pushBack(cd[i]);
+                this.cmList_.pushBack(cm[i]);
+                this.circulationList_.pushBack(circulation[i]);
+            }
+            this.it_ = it.last;
+            this.t0_ = time.last;
+            this.first_res_ = res.first;
+        }
     }
 
     proc solve() {
         var normalized_res: real(64) = 1e12;
-        var first_res : real(64) = 1e12;
+        var res : real(64) = 1e12;        // Current residual (absolute)
+        var res_prev : real(64) = 1e12;  // Previous iteration residual for line search
+        var omega : real(64) = this.inputs_.OMEGA_;  // Current relaxation factor
         var time: stopwatch;
-        while (normalized_res > this.inputs_.CONV_TOL_ && this.it_ < this.inputs_.IT_MAX_ && isNan(normalized_res) == false) {
+
+        // Initial residual
+        res = RMSE(this.spatialDisc_.res_, this.spatialDisc_.elemVolume_);
+        if this.inputs_.START_FILENAME_ == "" {
+            this.first_res_ = res;
+        }
+        normalized_res = res / this.first_res_;
+        const res_wall = RMSE(this.spatialDisc_.res_[this.spatialDisc_.wall_dom], this.spatialDisc_.elemVolume_[this.spatialDisc_.wall_dom]);
+        const res_farfield = RMSE(this.spatialDisc_.res_[this.spatialDisc_.farfield_dom], this.spatialDisc_.elemVolume_[this.spatialDisc_.farfield_dom]);
+        const res_fluid = RMSE(this.spatialDisc_.res_[this.spatialDisc_.fluid_dom], this.spatialDisc_.elemVolume_[this.spatialDisc_.fluid_dom]);
+        const res_wake = RMSE(this.spatialDisc_.res_[this.spatialDisc_.wake_dom], this.spatialDisc_.elemVolume_[this.spatialDisc_.wake_dom]);
+        const res_shock = RMSE(this.spatialDisc_.res_[this.spatialDisc_.shock_dom], this.spatialDisc_.elemVolume_[this.spatialDisc_.shock_dom]);
+        const (Cl, Cd, Cm) = this.spatialDisc_.computeAerodynamicCoefficients();
+        const elapsed = this.t0_;
+        writeln(" Time: ", elapsed, " It: ", this.it_,
+                " res: ", res, " norm res: ", normalized_res, " kutta res: ", this.spatialDisc_.kutta_res_,
+                " res wall: ", res_wall, " res farfield: ", res_farfield, " res fluid: ", res_fluid, " res wake: ", res_wake, " res shock: ", res_shock,
+                " Cl: ", Cl, " Cd: ", Cd, " Cm: ", Cm, " Circulation: ", this.spatialDisc_.circulation_);
+        this.timeList_.pushBack(elapsed);
+        this.itList_.pushBack(this.it_);
+        this.resList_.pushBack(res);
+        this.clList_.pushBack(Cl);
+        this.cdList_.pushBack(Cd);
+        this.cmList_.pushBack(Cm);
+        this.circulationList_.pushBack(this.spatialDisc_.circulation_);
+
+        while ((normalized_res > this.inputs_.CONV_TOL_ && res > this.inputs_.CONV_ATOL_) && this.it_ < this.inputs_.IT_MAX_ && isNan(normalized_res) == false) {
             this.it_ += 1;
             time.start();
 
-            this.spatialDisc_.run();
-
             this.computeJacobian();
+            
+            // Always use full Newton step in RHS (omega will be applied to the solution update)
             forall elem in 1..this.spatialDisc_.nelemDomain_ {
-                this.b_petsc.set(elem-1, -this.inputs_.OMEGA_ * this.spatialDisc_.res_[elem]);
+                this.b_petsc.set(elem-1, -this.spatialDisc_.res_[elem]);
             }
-            this.b_petsc.set(this.gammaIndex_, -this.inputs_.OMEGA_ * this.spatialDisc_.kutta_res_);
             this.b_petsc.assemblyComplete();
 
-            const (its, reason) = GMRES(this.ksp, this.A_petsc, this.b_petsc, this.x_petsc);
+            var its: int;
+            var reason: int;
 
-            forall elem in 1..this.spatialDisc_.nelemDomain_ {
-                this.spatialDisc_.phi_[elem] += this.x_petsc.get(elem-1);
-            }
+            // === PETSC GMRES ===
+            const (petscIts, petscReason) = GMRES(this.ksp, this.A_petsc, this.b_petsc, this.x_petsc);
+            its = petscIts;
+            reason = petscReason;
             
-            // Update circulation from the Newton step
-            this.spatialDisc_.circulation_ += this.x_petsc.get(this.gammaIndex_);
-
-            const res = RMSE(this.spatialDisc_.res_, this.spatialDisc_.elemVolume_);
-            if this.it_ == 1 {
-                first_res = res;
+            var lineSearchIts = 0;
+            omega = this.inputs_.OMEGA_;
+            
+            // === NO LINE SEARCH - fixed omega ===
+            forall elem in 1..this.spatialDisc_.nelemDomain_ {
+                this.spatialDisc_.phi_[elem] += omega * this.x_petsc.get(elem-1);
             }
+            const phi_upper = this.spatialDisc_.phi_[this.spatialDisc_.upperTEelem_] + (this.spatialDisc_.uu_[this.spatialDisc_.upperTEelem_] * this.spatialDisc_.deltaSupperTEx_ + this.spatialDisc_.vv_[this.spatialDisc_.upperTEelem_] * this.spatialDisc_.deltaSupperTEy_);
+            const phi_lower = this.spatialDisc_.phi_[this.spatialDisc_.lowerTEelem_] + (this.spatialDisc_.uu_[this.spatialDisc_.lowerTEelem_] * this.spatialDisc_.deltaSlowerTEx_ + this.spatialDisc_.vv_[this.spatialDisc_.lowerTEelem_] * this.spatialDisc_.deltaSlowerTEy_);
+            const gamma_computed = phi_upper - phi_lower;
+            this.spatialDisc_.circulation_ = gamma_computed;
+            
+            // Compute residual for convergence check
+            this.spatialDisc_.run();
+            res = RMSE(this.spatialDisc_.res_, this.spatialDisc_.elemVolume_);
+            
+            res_prev = res;
+            normalized_res = res / this.first_res_;
 
-            normalized_res = res / first_res;
+            if normalized_res < this.inputs_.FREEZE_MU_TOL_ {
+                this.spatialDisc_.FREEZE_MU_ = true;
+            }
 
             const res_wall = RMSE(this.spatialDisc_.res_[this.spatialDisc_.wall_dom], this.spatialDisc_.elemVolume_[this.spatialDisc_.wall_dom]);
+            const res_farfield = RMSE(this.spatialDisc_.res_[this.spatialDisc_.farfield_dom], this.spatialDisc_.elemVolume_[this.spatialDisc_.farfield_dom]);
             const res_fluid = RMSE(this.spatialDisc_.res_[this.spatialDisc_.fluid_dom], this.spatialDisc_.elemVolume_[this.spatialDisc_.fluid_dom]);
             const res_wake = RMSE(this.spatialDisc_.res_[this.spatialDisc_.wake_dom], this.spatialDisc_.elemVolume_[this.spatialDisc_.wake_dom]);
+            const res_shock = RMSE(this.spatialDisc_.res_[this.spatialDisc_.shock_dom], this.spatialDisc_.elemVolume_[this.spatialDisc_.shock_dom]);
 
             const (Cl, Cd, Cm) = this.spatialDisc_.computeAerodynamicCoefficients();
             time.stop();
-            const elapsed = time.elapsed();
+            const elapsed = time.elapsed() + this.t0_;
+
             writeln(" Time: ", elapsed, " It: ", this.it_,
-                    " res: ", res, " norm res: ", normalized_res,
-                    " res wall: ", res_wall, " res fluid: ", res_fluid, " res wake: ", res_wake,
+                    " res: ", res, " norm res: ", normalized_res, " kutta res: ", this.spatialDisc_.kutta_res_,
+                    " res wall: ", res_wall, " res farfield: ", res_farfield, " res fluid: ", res_fluid, " res wake: ", res_wake, " res shock: ", res_shock,
                     " Cl: ", Cl, " Cd: ", Cd, " Cm: ", Cm, " Circulation: ", this.spatialDisc_.circulation_,
-                    " GMRES its: ", its, " reason: ", reason);
+                    " GMRES its: ", its, " reason: ", reason, " omega: ", omega);
 
             this.timeList_.pushBack(elapsed);
             this.itList_.pushBack(this.it_);

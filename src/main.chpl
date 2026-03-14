@@ -21,12 +21,15 @@ proc main() {
         t_ini.start();
 
         var inputs = new potentialInputs();
+        inputs.initializeFlowField();
+
         var Mesh = new shared MeshData(inputs.GRID_FILENAME_, inputs.ELEMENT_TYPE_);
         Mesh.buildConnectivity();
+        writeln("Mesh loaded: ", Mesh.nelem_, " elements");
 
         var spatialDisc = new shared spatialDiscretization(Mesh, inputs);
-
         var steadySolver = new shared temporalDiscretization(spatialDisc, inputs);
+        
         steadySolver.initialize();
         steadySolver.solve();
 
