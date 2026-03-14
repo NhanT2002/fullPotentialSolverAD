@@ -1,7 +1,5 @@
 module temporalDiscretizationAnalyticalExact {
 use temporalDiscretization;
-use List;
-use Set;
 
 // Hand-coded reduced exact Jacobian assembly.
 
@@ -19,10 +17,9 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
         halt("Analytical reduced exact Jacobian failed: dR_gamma/dGamma is too small");
 
     const rows = 1..this.spatialDisc_.nelemDomain_;
-    var rowCols: [rows] list(int);
-    var rowVals: [rows] list(real(64));
+    var mergedVals: [this.rowMergedDataDom] real(64) = 0.0;
 
-    forall row in rows with (ref rowCols, ref rowVals) {
+    forall row in rows with (ref mergedVals) {
         const rowStencil = this.buildRowStencil(row);
         const rowDom = {0..<rowStencil.size};
         var rowDphi: [rowDom] real(64) = 0.0;
@@ -44,11 +41,11 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
         var drhoFace: [rowDom] real(64) = 0.0;
         var duTmp: [rowDom] real(64) = 0.0;
         var dvTmp: [rowDom] real(64) = 0.0;
-        const faces = this.spatialDisc_.mesh_.elem2edge_[
-            this.spatialDisc_.mesh_.elem2edgeIndex_[row] + 1 ..
-            this.spatialDisc_.mesh_.elem2edgeIndex_[row + 1]];
+        const rowFaceStart = this.rowFaceOffsets[row];
+        const rowFaceStop = this.rowFaceOffsets[row + 1];
 
-        for face in faces {
+        for rowFaceIdx in rowFaceStart..<rowFaceStop {
+            const face = this.rowFaceData[rowFaceIdx];
             const elem1 = this.spatialDisc_.mesh_.edge2elem_[1, face];
             const elem2 = this.spatialDisc_.mesh_.edge2elem_[2, face];
             const sign = if elem1 == row then 1.0 else -1.0;
@@ -122,18 +119,8 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
                 else if kuttaType1 == -1 && kuttaType2 == 1 then
                     dDeltaPhiGamma = -1.0;
             }
-            const idxMinus = if elem1 <= sd.nelemDomain_ then
-                                 findStencilIndex(rowStencil, elem1)
-                             else if isWallFace(sd, face) then
-                                 findStencilIndex(rowStencil, elem2)
-                             else
-                                 -1;
-            const idxPlus = if elem2 <= sd.nelemDomain_ then
-                                findStencilIndex(rowStencil, elem2)
-                            else if isWallFace(sd, face) then
-                                findStencilIndex(rowStencil, elem1)
-                            else
-                                -1;
+            const idxMinus = this.rowFaceMinusIdx[rowFaceIdx];
+            const idxPlus = this.rowFacePlusIdx[rowFaceIdx];
             if idxMinus >= 0 then dDeltaPhi[idxMinus] -= 1.0;
             if idxPlus >= 0 then dDeltaPhi[idxPlus] += 1.0;
 
@@ -258,20 +245,15 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
             rowDgamma += sign * area * (drhoFaceGamma * qFace + rhoFace * dqGamma) * sd.res_scale_;
         }
 
-        var stencilSet = new set(int);
-        for col in rowStencil do stencilSet.add(col);
-        for col in kuttaStencil do stencilSet.add(col);
-
-        for col in stencilSet {
-            const rowIdx = findStencilIndex(rowStencil, col);
-            const kuttaIdx = findStencilIndex(kuttaStencil, col);
+        const mergedStart = this.rowMergedOffsets[row];
+        const mergedStop = this.rowMergedOffsets[row + 1];
+        const gammaFactor = rowDgamma / kuttaDgamma;
+        for mergedIdx in mergedStart..<mergedStop {
+            const rowIdx = this.rowMergedRowIdx[mergedIdx];
+            const kuttaIdx = this.rowMergedKuttaIdx[mergedIdx];
             const rowValue = if rowIdx >= 0 then rowDphi[rowIdx] else 0.0;
             const kuttaValue = if kuttaIdx >= 0 then kuttaDphi[kuttaIdx] else 0.0;
-            const reducedValue = rowValue - (rowDgamma / kuttaDgamma) * kuttaValue;
-            if abs(reducedValue) > AD_ROW_PRINT_TOL || col == row {
-                rowCols[row].pushBack(col);
-                rowVals[row].pushBack(reducedValue);
-            }
+            mergedVals[mergedIdx] = rowValue - gammaFactor * kuttaValue;
         }
     }
 
@@ -281,8 +263,14 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
     }
 
     for row in rows {
-        for (col, val) in zip(rowCols[row], rowVals[row]) do
-            this.A_petsc.add(row - 1, col - 1, val);
+        const mergedStart = this.rowMergedOffsets[row];
+        const mergedStop = this.rowMergedOffsets[row + 1];
+        for mergedIdx in mergedStart..<mergedStop {
+            const col = this.rowMergedCols[mergedIdx];
+            const val = mergedVals[mergedIdx];
+            if abs(val) > AD_ROW_PRINT_TOL || col == row then
+                this.A_petsc.add(row - 1, col - 1, val);
+        }
     }
 
     this.A_petsc.assemblyComplete();

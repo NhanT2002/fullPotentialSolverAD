@@ -47,6 +47,7 @@ config const BETA_THRESHOLD : real(64) = 1e-4; // Residual threshold to reduce B
 config const LINE_SEARCH : bool = false;
 config const MAX_LINE_SEARCH : int = 5;
 config const SUFFICIENT_DECREASE : real(64) = 1.2;
+config const PROFILE_ITERATION_TIMINGS : bool = false;
 
 // Selective Frequency Damping (SFD) parameters (Jordi et al. 2014 encapsulated formulation)
 config const SFD_ENABLED : bool = false;     // Enable SFD acceleration
@@ -151,6 +152,7 @@ record potentialInputs {
     var LINE_SEARCH_: bool = LINE_SEARCH;
     var MAX_LINE_SEARCH_: int = MAX_LINE_SEARCH;
     var SUFFICIENT_DECREASE_: real(64) = SUFFICIENT_DECREASE;
+    var PROFILE_ITERATION_TIMINGS_: bool = PROFILE_ITERATION_TIMINGS;
 
     // SFD parameters
     var SFD_ENABLED_: bool = SFD_ENABLED;

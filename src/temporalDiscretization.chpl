@@ -656,9 +656,19 @@ proc solveConsistentGammaForPhi(sd: borrowed spatialDiscretization,
 }
 
 proc findStencilIndex(stencil: [?D] int, col: int): int {
-    for idx in D do
-        if stencil[idx] == col then
-            return idx;
+    var lo = D.low;
+    var hi = D.high;
+
+    while lo <= hi {
+        const mid = (lo + hi) / 2;
+        const value = stencil[mid];
+        if value == col then
+            return mid;
+        if value < col then
+            lo = mid + 1;
+        else
+            hi = mid - 1;
+    }
     return -1;
 }
 
@@ -833,6 +843,18 @@ class temporalDiscretization {
     var rowStencilOffsets: [rowStencilOffsetDom] int;
     var rowStencilDataDom: domain(1) = {0..<0};
     var rowStencilData: [rowStencilDataDom] int;
+    var rowFaceOffsetDom: domain(1) = {1..0};
+    var rowFaceOffsets: [rowFaceOffsetDom] int;
+    var rowFaceDataDom: domain(1) = {0..<0};
+    var rowFaceData: [rowFaceDataDom] int;
+    var rowFaceMinusIdx: [rowFaceDataDom] int;
+    var rowFacePlusIdx: [rowFaceDataDom] int;
+    var rowMergedOffsetDom: domain(1) = {1..0};
+    var rowMergedOffsets: [rowMergedOffsetDom] int;
+    var rowMergedDataDom: domain(1) = {0..<0};
+    var rowMergedCols: [rowMergedDataDom] int;
+    var rowMergedRowIdx: [rowMergedDataDom] int;
+    var rowMergedKuttaIdx: [rowMergedDataDom] int;
     var kuttaStencilCacheDom: domain(1) = {0..<0};
     var kuttaStencilCache: [kuttaStencilCacheDom] int;
 
@@ -1089,9 +1111,16 @@ class temporalDiscretization {
         const nelem = this.spatialDisc_.nelemDomain_;
         this.rowStencilOffsetDom = {1..nelem + 1};
         this.rowStencilOffsets = 0;
+        this.rowFaceOffsetDom = {1..nelem + 1};
+        this.rowFaceOffsets = 0;
 
         var totalSize = 0;
+        var totalFaceEntries = 0;
         for row in 1..nelem {
+            const faceStart = this.spatialDisc_.mesh_.elem2edgeIndex_[row] + 1;
+            const faceEnd = this.spatialDisc_.mesh_.elem2edgeIndex_[row + 1];
+            totalFaceEntries += faceEnd - faceStart + 1;
+
             this.rowStencilOffsets[row] = totalSize;
             totalSize += this.buildRowStencilUncached(row).size;
         }
@@ -1109,6 +1138,102 @@ class temporalDiscretization {
         const kuttaStencil = this.buildKuttaStencilUncached();
         this.kuttaStencilCacheDom = {0..<kuttaStencil.size};
         this.kuttaStencilCache = kuttaStencil;
+
+        this.rowFaceDataDom = {0..<totalFaceEntries};
+        this.rowFaceData = 0;
+        this.rowFaceMinusIdx = -1;
+        this.rowFacePlusIdx = -1;
+
+        var totalMergedSize = 0;
+        this.rowMergedOffsetDom = {1..nelem + 1};
+        this.rowMergedOffsets = 0;
+        for row in 1..nelem {
+            const rowStencil = this.buildRowStencil(row);
+            var rowIdx = rowStencil.domain.low;
+            var kuttaIdx = kuttaStencil.domain.low;
+            var mergedCount = 0;
+
+            while rowIdx <= rowStencil.domain.high || kuttaIdx <= kuttaStencil.domain.high {
+                if kuttaIdx > kuttaStencil.domain.high ||
+                   (rowIdx <= rowStencil.domain.high && rowStencil[rowIdx] < kuttaStencil[kuttaIdx]) {
+                    rowIdx += 1;
+                } else if rowIdx > rowStencil.domain.high ||
+                          kuttaStencil[kuttaIdx] < rowStencil[rowIdx] {
+                    kuttaIdx += 1;
+                } else {
+                    rowIdx += 1;
+                    kuttaIdx += 1;
+                }
+                mergedCount += 1;
+            }
+
+            this.rowMergedOffsets[row] = totalMergedSize;
+            totalMergedSize += mergedCount;
+        }
+        this.rowMergedOffsets[nelem + 1] = totalMergedSize;
+
+        this.rowMergedDataDom = {0..<totalMergedSize};
+        this.rowMergedCols = 0;
+        this.rowMergedRowIdx = -1;
+        this.rowMergedKuttaIdx = -1;
+
+        var faceOffset = 0;
+        for row in 1..nelem {
+            const rowStencil = this.buildRowStencil(row);
+            const faceStart = this.spatialDisc_.mesh_.elem2edgeIndex_[row] + 1;
+            const faceEnd = this.spatialDisc_.mesh_.elem2edgeIndex_[row + 1];
+
+            this.rowFaceOffsets[row] = faceOffset;
+            for faceIdx in faceStart..faceEnd {
+                const face = this.spatialDisc_.mesh_.elem2edge_[faceIdx];
+                const elem1 = this.spatialDisc_.mesh_.edge2elem_[1, face];
+                const elem2 = this.spatialDisc_.mesh_.edge2elem_[2, face];
+
+                this.rowFaceData[faceOffset] = face;
+                this.rowFaceMinusIdx[faceOffset] =
+                    if elem1 <= this.spatialDisc_.nelemDomain_ then
+                        findStencilIndex(rowStencil, elem1)
+                    else if isWallFace(this.spatialDisc_.borrow(), face) then
+                        findStencilIndex(rowStencil, elem2)
+                    else
+                        -1;
+                this.rowFacePlusIdx[faceOffset] =
+                    if elem2 <= this.spatialDisc_.nelemDomain_ then
+                        findStencilIndex(rowStencil, elem2)
+                    else if isWallFace(this.spatialDisc_.borrow(), face) then
+                        findStencilIndex(rowStencil, elem1)
+                    else
+                        -1;
+                faceOffset += 1;
+            }
+
+            const mergedStart = this.rowMergedOffsets[row];
+            var mergedOffset = mergedStart;
+            var rowIdx = rowStencil.domain.low;
+            var kuttaIdx = kuttaStencil.domain.low;
+
+            while rowIdx <= rowStencil.domain.high || kuttaIdx <= kuttaStencil.domain.high {
+                if kuttaIdx > kuttaStencil.domain.high ||
+                   (rowIdx <= rowStencil.domain.high && rowStencil[rowIdx] < kuttaStencil[kuttaIdx]) {
+                    this.rowMergedCols[mergedOffset] = rowStencil[rowIdx];
+                    this.rowMergedRowIdx[mergedOffset] = rowIdx;
+                    rowIdx += 1;
+                } else if rowIdx > rowStencil.domain.high ||
+                          kuttaStencil[kuttaIdx] < rowStencil[rowIdx] {
+                    this.rowMergedCols[mergedOffset] = kuttaStencil[kuttaIdx];
+                    this.rowMergedKuttaIdx[mergedOffset] = kuttaIdx;
+                    kuttaIdx += 1;
+                } else {
+                    this.rowMergedCols[mergedOffset] = rowStencil[rowIdx];
+                    this.rowMergedRowIdx[mergedOffset] = rowIdx;
+                    this.rowMergedKuttaIdx[mergedOffset] = kuttaIdx;
+                    rowIdx += 1;
+                    kuttaIdx += 1;
+                }
+                mergedOffset += 1;
+            }
+        }
+        this.rowFaceOffsets[nelem + 1] = faceOffset;
     }
 
     proc solve() {
@@ -1154,20 +1279,31 @@ class temporalDiscretization {
             time.start();
             const reducedExactMode = isReducedExactJacobianType(this.inputs_.JACOBIAN_TYPE_);
             res_prev = res;
+            var jacobianTimer: stopwatch;
+            var rhsTimer: stopwatch;
+            var linearSolveTimer: stopwatch;
+            var lineSearchTimer: stopwatch;
+            var postProcessTimer: stopwatch;
 
+            jacobianTimer.start();
             this.computeJacobian();
+            jacobianTimer.stop();
             
             // Always use full Newton step in RHS (omega will be applied to the solution update)
+            rhsTimer.start();
             forall elem in 1..this.spatialDisc_.nelemDomain_ {
                 this.b_petsc.set(elem-1, -this.spatialDisc_.res_[elem]);
             }
             this.b_petsc.assemblyComplete();
+            rhsTimer.stop();
 
             var its: int;
             var reason: int;
 
             // === PETSC GMRES ===
+            linearSolveTimer.start();
             const (petscIts, petscReason) = GMRES(this.ksp, this.A_petsc, this.b_petsc, this.x_petsc);
+            linearSolveTimer.stop();
             its = petscIts;
             reason = petscReason;
             
@@ -1187,6 +1323,7 @@ class temporalDiscretization {
             var accepted = false;
             const maxLineSearch = if this.inputs_.LINE_SEARCH_ then max(0, this.inputs_.MAX_LINE_SEARCH_) else 0;
 
+            lineSearchTimer.start();
             for ls in 0..maxLineSearch {
                 lineSearchIts = ls;
                 if ls > 0 then
@@ -1245,7 +1382,9 @@ class temporalDiscretization {
                     omega = 0.0;
                 }
             }
+            lineSearchTimer.stop();
 
+            postProcessTimer.start();
             normalized_res = res / this.first_res_;
 
             const res_wall = RMSE(this.spatialDisc_.res_[this.spatialDisc_.wall_dom], this.spatialDisc_.elemVolume_[this.spatialDisc_.wall_dom]);
@@ -1256,13 +1395,23 @@ class temporalDiscretization {
 
             const (Cl, Cd, Cm) = this.spatialDisc_.computeAerodynamicCoefficients();
             time.stop();
-            const elapsed = time.elapsed() + this.t0_;
+            postProcessTimer.stop();
+            const iterTime = time.elapsed();
+            const elapsed = iterTime + this.t0_;
 
             writeln(" Time: ", elapsed, " It: ", this.it_,
                     " res: ", res, " norm res: ", normalized_res, " kutta res: ", this.spatialDisc_.kutta_res_,
                     " res wall: ", res_wall, " res farfield: ", res_farfield, " res fluid: ", res_fluid, " res wake: ", res_wake, " res shock: ", res_shock,
                     " Cl: ", Cl, " Cd: ", Cd, " Cm: ", Cm, " Circulation: ", this.spatialDisc_.circulation_,
                     " GMRES its: ", its, " reason: ", reason, " omega: ", omega, " ls its: ", lineSearchIts);
+            if this.inputs_.PROFILE_ITERATION_TIMINGS_ {
+                writeln("    Timing dt: ", iterTime,
+                        " jac: ", jacobianTimer.elapsed(),
+                        " rhs: ", rhsTimer.elapsed(),
+                        " linear: ", linearSolveTimer.elapsed(),
+                        " ls/update: ", lineSearchTimer.elapsed(),
+                        " post: ", postProcessTimer.elapsed());
+            }
 
             this.timeList_.pushBack(elapsed);
             this.itList_.pushBack(this.it_);
