@@ -1441,7 +1441,34 @@ class temporalDiscretization {
             reason = petscReason;
             
             var lineSearchIts = 0;
-            omega = this.inputs_.OMEGA_;
+            if this.inputs_.OMEGA_RAMP_ {
+                const rampEvery = max(1, this.inputs_.OMEGA_RAMP_IT_);
+                const rampStage = (this.it_ - 1) / rampEvery;
+                var omegaRamp = this.inputs_.OMEGA_START_;
+                for 1..rampStage do
+                    omegaRamp *= this.inputs_.OMEGA_RAMP_FACTOR_;
+                omega = min(omegaRamp, this.inputs_.OMEGA_RAMP_MAX_);
+                if abs(omega - this.inputs_.lastOmega_) > 1.0e-14 {
+                    writeln("OMEGA ramp increased to ", omega, " at iteration ", this.it_);
+                    this.inputs_.lastOmega_ = omega;
+                }
+            } else if this.inputs_.ADAPTIVE_OMEGA_ {
+                if normalized_res <= this.inputs_.OMEGA_THRESHOLD_ {
+                    omega = this.inputs_.OMEGA_FINAL_;
+                    if !this.inputs_.omegaAdapted_ {
+                        writeln("Adaptive OMEGA switched to ", omega,
+                                " at normalized residual ", normalized_res);
+                        this.inputs_.omegaAdapted_ = true;
+                        this.inputs_.lastOmega_ = omega;
+                    }
+                } else {
+                    omega = this.inputs_.OMEGA_START_;
+                    this.inputs_.lastOmega_ = omega;
+                }
+            } else {
+                omega = this.inputs_.OMEGA_;
+                this.inputs_.lastOmega_ = omega;
+            }
 
             const phiDom = {1..this.spatialDisc_.nelemDomain_};
             var phiSaved: [phiDom] real(64);

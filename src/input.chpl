@@ -21,6 +21,14 @@ config const CFL_RAMP_IT : int;
 config const CFL_RAMP_MAX : real(64);
 config const OMEGA_CIRCULATION : real(64); // Relaxation factor for circulation update
 config const OMEGA : real(64); // Relaxation factor for the iterative solver
+config const ADAPTIVE_OMEGA : bool = false;  // Enable residual-based omega switch
+config const OMEGA_START : real(64) = OMEGA; // Initial relaxation factor
+config const OMEGA_FINAL : real(64) = OMEGA; // Final relaxation factor for residual-based switching
+config const OMEGA_THRESHOLD : real(64) = 1e-2; // Switch to OMEGA_FINAL when normalized residual drops below this
+config const OMEGA_RAMP : bool = false;  // Enable CFD-style iteration-based omega ramp
+config const OMEGA_RAMP_FACTOR : real(64) = 1.1; // Multiplicative omega growth factor
+config const OMEGA_RAMP_IT : int = 5;  // Increase omega every OMEGA_RAMP_IT nonlinear iterations
+config const OMEGA_RAMP_MAX : real(64) = OMEGA; // Maximum omega reached by the ramp
 config const IT_MAX : int;
 config const CONV_TOL : real(64);
 config const CONV_ATOL : real(64) = 1e-15;  // Absolute convergence tolerance for residual
@@ -113,6 +121,16 @@ record potentialInputs {
     var CFL_RAMP_MAX_ : real(64) = CFL_RAMP_MAX;
     var OMEGA_CIRCULATION_ : real(64) = OMEGA_CIRCULATION;
     var OMEGA_ : real(64) = OMEGA;
+    var ADAPTIVE_OMEGA_ : bool = ADAPTIVE_OMEGA;
+    var OMEGA_START_ : real(64) = OMEGA_START;
+    var OMEGA_FINAL_ : real(64) = OMEGA_FINAL;
+    var OMEGA_THRESHOLD_ : real(64) = OMEGA_THRESHOLD;
+    var OMEGA_RAMP_ : bool = OMEGA_RAMP;
+    var OMEGA_RAMP_FACTOR_ : real(64) = OMEGA_RAMP_FACTOR;
+    var OMEGA_RAMP_IT_ : int = OMEGA_RAMP_IT;
+    var OMEGA_RAMP_MAX_ : real(64) = OMEGA_RAMP_MAX;
+    var omegaAdapted_ : bool = false;  // Track whether the final omega has been activated
+    var lastOmega_ : real(64) = OMEGA_START;  // Track the currently active omega schedule value
     var IT_MAX_: int = IT_MAX;
     var CONV_TOL_ : real(64) = CONV_TOL;
     var CONV_ATOL_ : real(64) = CONV_ATOL;  // Absolute convergence tolerance
@@ -216,6 +234,13 @@ record potentialInputs {
         writeln("Y_REF = ", Y_REF);
         writeln("MU_C = ", MU_C);
         writeln("MACH_C = ", MACH_C);
+        if OMEGA_RAMP {
+            writeln("OMEGA_RAMP enabled: start=", OMEGA_START, " factor=", OMEGA_RAMP_FACTOR,
+                    " every ", OMEGA_RAMP_IT, " iterations, max=", OMEGA_RAMP_MAX);
+        } else if ADAPTIVE_OMEGA {
+            writeln("ADAPTIVE_OMEGA enabled: ", OMEGA_START, " -> ", OMEGA_FINAL,
+                    " (switch at norm res ", OMEGA_THRESHOLD, ")");
+        }
         if MACH_CONTINUATION {
             writeln("MACH_CONTINUATION enabled: ", MACH_START, " -> ", MACH, " (step ", MACH_STEP, ")");
         }
