@@ -23,6 +23,7 @@ def readCGNS(filename) :
         VelocityX_wall = f['WallBase/wall/WALL_FLOW_SOLUTION_CC/uWall/ data'][:]
         VelocityY_wall = f['WallBase/wall/WALL_FLOW_SOLUTION_CC/vWall/ data'][:]
         Cp = f['WallBase/wall/WALL_FLOW_SOLUTION_CC/cpWall/ data'][:]
+        mach = f['WallBase/wall/WALL_FLOW_SOLUTION_CC/machWall/ data'][:]
 
         it = f['Base/GlobalConvergenceHistory/IterationCounters/ data'][:]
         time = f['Base/GlobalConvergenceHistory/Time/ data'][:]
@@ -52,6 +53,7 @@ def readCGNS(filename) :
         data['VelocityX_wall'] = VelocityX_wall
         data['VelocityY_wall'] = VelocityY_wall
         data['Cp_wall'] = Cp
+        data['Mach_wall'] = mach
 
         data['it'] = it
         data['time'] = time
@@ -74,9 +76,13 @@ def readHSPM(filename) :
             'Y_wall': y,
             'Cp_wall': cp}
 
-data = readCGNS("../output/output_238.cgns")
-data2 = readCGNS("../output/output_240.cgns")
-data3 = readCGNS("../output/output_253.cgns")
+data = readCGNS("../output/output_289.cgns")
+data2 = readCGNS("../output/output_287.cgns")
+data3 = readCGNS("../output/output_288.cgns")
+
+# data = readCGNS("../output/output_277.cgns")
+# data2 = readCGNS("../output/output_278.cgns")
+# data3 = readCGNS("../output/output_279.cgns")
 
 
 plt.figure()
@@ -90,11 +96,31 @@ plt.title('Pressure Coefficient Distribution on Wall')
 plt.legend()
 plt.grid()
 
+# plt.figure()
+# plt.plot(data['X_wall'], data['Mach_wall'], '-', label='data')
+# plt.plot(data2['X_wall'], data2['Mach_wall'], '-', label='data2')
+# plt.plot(data3['X_wall'], data3['Mach_wall'], '-', label='data3')
+# plt.xlabel('x')
+# plt.ylabel('Mach number on wall')
+# plt.title('Mach Number Distribution on Wall')
+# plt.legend()
+# plt.grid()
+
 plt.figure()
 plt.semilogy(data['it'], data['res'], label='data')
 plt.semilogy(data2['it'], data2['res'], label='data2')
 plt.semilogy(data3['it'], data3['res'], label='data3')
 plt.xlabel('Iteration')
+plt.ylabel('Normalized Residual')
+plt.title('Convergence History')
+plt.legend()
+plt.grid()
+
+plt.figure()
+plt.semilogy(data['time'], data['res'], label='data')
+plt.semilogy(data2['time'], data2['res'], label='data2')
+plt.semilogy(data3['time'], data3['res'], label='data3')
+plt.xlabel('Time (s)')
 plt.ylabel('Normalized Residual')
 plt.title('Convergence History')
 plt.legend()

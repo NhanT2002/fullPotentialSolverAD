@@ -250,6 +250,56 @@ proc temporalDiscretization.computeApproximateAnalyticalJacobian() {
             this.A_petsc.add(elem - 1, upperTE_influences - 1, dRes_dPhi_upper);
             this.A_petsc.add(elem - 1, lowerTE_influences - 1, dRes_dPhi_lower);
         }
+
+        // Store diag for possible use in upwinding
+        this.Jij_[elem] = diag;
+    }
+
+    
+    // === BETA-BASED UPWIND AUGMENTATION (element-centric for parallelization) ===
+    // Loop over elements instead of faces to avoid race conditions.
+    // Each element checks its faces to see if it's the downwind cell of a supersonic face.
+    // Reuses upwindElem_ computed during artificial density calculation.
+    forall elem in 1..this.spatialDisc_.nelemDomain_ {
+        const faces = this.spatialDisc_.mesh_.elem2edge_[
+            this.spatialDisc_.mesh_.elem2edgeIndex_[elem] + 1 ..
+            this.spatialDisc_.mesh_.elem2edgeIndex_[elem + 1]];
+            
+        for face in faces {
+            const machFace = this.spatialDisc_.machFace_[face];
+            
+            if machFace >= this.spatialDisc_.inputs_.MACH_C_ {
+                const elem1 = this.spatialDisc_.mesh_.edge2elem_[1, face];
+                const elem2 = this.spatialDisc_.mesh_.edge2elem_[2, face];
+                
+                // Both cells must be interior (not ghost cells)
+                if elem1 <= this.spatialDisc_.nelemDomain_ && elem2 <= this.spatialDisc_.nelemDomain_ {
+                    // Reuse upwind/downwind elements computed during artificial density
+                    const upwindElem = this.spatialDisc_.upwindElem_[face];
+                    const downwindElem = this.spatialDisc_.downwindElem_[face];
+                    
+                    // Only process if this element is the downwind cell
+                    // This ensures each matrix entry is only written by one task
+                    if downwindElem == elem {
+                        // Use precomputed invL_IJ_ (inverse of cell centroid distance)
+                        const increase = this.inputs_.BETA_ * this.spatialDisc_.velMagFace_[face] 
+                        * this.spatialDisc_.invL_IJ_[face] * this.spatialDisc_.res_scale_;
+                        
+                        // Increase absolute value of diagonal term for downwind element
+                        const diagTerm = this.Jij_[elem];
+                        if diagTerm >= 0.0 {
+                            // Increase diagonal and decrease off-diagonal
+                            this.A_petsc.add(elem-1, elem-1, increase);
+                            this.A_petsc.add(elem-1, upwindElem-1, -increase);
+                        } else {
+                            // Decrease diagonal and increase off-diagonal
+                            this.A_petsc.add(elem-1, elem-1, -increase);
+                            this.A_petsc.add(elem-1, upwindElem-1, increase);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     this.A_petsc.assemblyComplete();

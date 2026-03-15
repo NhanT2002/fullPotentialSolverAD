@@ -74,7 +74,11 @@ config const GMRES_MAXIT : int;
 config const GMRES_RESTART : int;
 config const GMRES_PRECON : string;
 config const GMRES_PRECON_SIDE : string = "right";  // Preconditioning side: "left" or "right"
-config const JACOBIAN_TYPE : string = "analytical";  // Jacobian type: "analytical", "numerical", "ad_reduced_exact", or "analytical_reduced_exact"
+config const JACOBIAN_TYPE : string = "analytical";  // Jacobian type: "analytical", "ad_reduced_exact", or "analytical_reduced_exact"
+config const ADAPTIVE_JACOBIAN : bool = false;  // Enable startup/final Jacobian switching
+config const JACOBIAN_START : string = JACOBIAN_TYPE;  // Startup Jacobian type
+config const JACOBIAN_FINAL : string = JACOBIAN_TYPE;  // Final Jacobian type
+config const JACOBIAN_SWITCH_THRESHOLD : real(64) = 1e-2;  // Switch to final Jacobian below this normalized residual
 config const USE_NATIVE_GMRES : bool = false;  // Use Chapel-native GMRES instead of PETSc
 
 // Adaptive (Inexact) Newton parameters - Eisenstat-Walker forcing terms
@@ -191,6 +195,12 @@ record potentialInputs {
     var GMRES_PRECON_: string = GMRES_PRECON;
     var GMRES_PRECON_SIDE_: string = GMRES_PRECON_SIDE;
     var JACOBIAN_TYPE_: string = JACOBIAN_TYPE;
+    var ADAPTIVE_JACOBIAN_: bool = ADAPTIVE_JACOBIAN;
+    var JACOBIAN_START_: string = JACOBIAN_START;
+    var JACOBIAN_FINAL_: string = JACOBIAN_FINAL;
+    var JACOBIAN_SWITCH_THRESHOLD_: real(64) = JACOBIAN_SWITCH_THRESHOLD;
+    var activeJacobianType_: string = if ADAPTIVE_JACOBIAN then JACOBIAN_START else JACOBIAN_TYPE;
+    var jacobianAdapted_: bool = false;
     var USE_NATIVE_GMRES_: bool = USE_NATIVE_GMRES;
 
     // Adaptive (Inexact) Newton parameters
@@ -240,6 +250,10 @@ record potentialInputs {
         } else if ADAPTIVE_OMEGA {
             writeln("ADAPTIVE_OMEGA enabled: ", OMEGA_START, " -> ", OMEGA_FINAL,
                     " (switch at norm res ", OMEGA_THRESHOLD, ")");
+        }
+        if ADAPTIVE_JACOBIAN {
+            writeln("ADAPTIVE_JACOBIAN enabled: ", JACOBIAN_START, " -> ", JACOBIAN_FINAL,
+                    " (switch at norm res ", JACOBIAN_SWITCH_THRESHOLD, ")");
         }
         if MACH_CONTINUATION {
             writeln("MACH_CONTINUATION enabled: ", MACH_START, " -> ", MACH, " (step ", MACH_STEP, ")");

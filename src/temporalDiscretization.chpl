@@ -58,6 +58,18 @@ inline proc isReducedExactJacobianType(jacobianType: string): bool {
     return jacobianType == "ad_reduced_exact" || jacobianType == "analytical_reduced_exact";
 }
 
+proc temporalDiscretization.activeJacobianType(): string {
+    return this.inputs_.activeJacobianType_;
+}
+
+proc temporalDiscretization.hasReducedExactJacobianPhase(): bool {
+    if this.inputs_.ADAPTIVE_JACOBIAN_ {
+        return isReducedExactJacobianType(this.inputs_.JACOBIAN_START_) ||
+               isReducedExactJacobianType(this.inputs_.JACOBIAN_FINAL_);
+    }
+    return isReducedExactJacobianType(this.inputs_.JACOBIAN_TYPE_);
+}
+
 proc isWallFace(sd: borrowed spatialDiscretization, face: int): bool {
     return sd.wallFaceSet_.contains(face);
 }
@@ -929,7 +941,7 @@ class temporalDiscretization {
     }
 
     proc initializeJacobian() {
-        if isReducedExactJacobianType(this.inputs_.JACOBIAN_TYPE_) {
+        if this.hasReducedExactJacobianPhase() {
             const kuttaStencil = this.buildKuttaStencil();
             for elem in 1..this.spatialDisc_.nelemDomain_ {
                 var stencilSet = new set(int);
@@ -979,11 +991,12 @@ class temporalDiscretization {
     proc computeJacobian() {
         // Dispatch to the selected Jacobian implementation so the solve loop
         // stays separate from the assembly details.
-        if this.inputs_.JACOBIAN_TYPE_ == "ad_reduced_exact" {
+        const jacobianType = this.activeJacobianType();
+        if jacobianType == "ad_reduced_exact" {
             this.computeADReducedExactJacobian();
             return;
         }
-        if this.inputs_.JACOBIAN_TYPE_ == "analytical_reduced_exact" {
+        if jacobianType == "analytical_reduced_exact" {
             this.computeAnalyticalReducedExactJacobian();
             return;
         }
@@ -995,7 +1008,7 @@ class temporalDiscretization {
         this.spatialDisc_.initializeKuttaCells();
         this.spatialDisc_.initializeSolution();
         this.spatialDisc_.run();
-        if isReducedExactJacobianType(this.inputs_.JACOBIAN_TYPE_) {
+        if this.hasReducedExactJacobianPhase() {
             this.enforceConsistentGammaForCurrentPhi();
             this.spatialDisc_.run();
         }
@@ -1410,7 +1423,16 @@ class temporalDiscretization {
         while ((normalized_res > this.inputs_.CONV_TOL_ && res > this.inputs_.CONV_ATOL_) && this.it_ < this.inputs_.IT_MAX_ && isNan(normalized_res) == false) {
             this.it_ += 1;
             time.start();
-            const reducedExactMode = isReducedExactJacobianType(this.inputs_.JACOBIAN_TYPE_);
+            if this.inputs_.ADAPTIVE_JACOBIAN_ &&
+               !this.inputs_.jacobianAdapted_ &&
+               normalized_res <= this.inputs_.JACOBIAN_SWITCH_THRESHOLD_ {
+                this.inputs_.activeJacobianType_ = this.inputs_.JACOBIAN_FINAL_;
+                this.inputs_.jacobianAdapted_ = true;
+                writeln("Adaptive Jacobian switched to ", this.inputs_.activeJacobianType_,
+                        " at normalized residual ", normalized_res);
+            }
+
+            const reducedExactMode = isReducedExactJacobianType(this.activeJacobianType());
             res_prev = res;
             var jacobianTimer: stopwatch;
             var rhsTimer: stopwatch;
