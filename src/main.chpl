@@ -27,11 +27,23 @@ proc main() {
         Mesh.buildConnectivity();
         writeln("Mesh loaded: ", Mesh.nelem_, " elements");
 
-        var spatialDisc = new shared spatialDiscretization(Mesh, inputs);
-        var steadySolver = new shared temporalDiscretization(spatialDisc, inputs);
-        
-        steadySolver.initialize();
-        steadySolver.solve();
+        if inputs.FLOW_ == "steady" {
+            var spatialDisc = new shared spatialDiscretization(Mesh, inputs);
+            var steadySolver = new shared temporalDiscretization(spatialDisc.borrow(), inputs);
+            
+            steadySolver.initialize();
+            steadySolver.solve();
+        }
+        else if inputs.FLOW_ == "IBM" {
+            var spatialDisc = new shared spatialDiscretizationIBM(Mesh, inputs);
+
+            var steadySolver = new shared temporalDiscretization(spatialDisc.borrow(), inputs);
+            steadySolver.initialize();
+            steadySolver.solve();
+        }
+        else {
+            writeln(inputs.FLOW_, " flow type not recognized. Please check the configuration.");
+        }
 
         t_ini.stop();
         writeln("total execution : ", t_ini.elapsed(), " seconds");

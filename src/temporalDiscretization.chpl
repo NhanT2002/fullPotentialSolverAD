@@ -19,8 +19,10 @@ use IO;
 // Keep nonlinear iteration control here and split the Jacobian assembly
 // implementations into dedicated extension-method modules.
 use temporalDiscretizationAD;
+use temporalDiscretizationADIBM;
 use temporalDiscretizationAnalyticalApprox;
 use temporalDiscretizationAnalyticalExact;
+use temporalDiscretizationAnalyticalIBM;
 
 config const CHECK_AD_ROW = false;
 config const AD_ROW = 0;
@@ -68,6 +70,47 @@ proc temporalDiscretization.hasReducedExactJacobianPhase(): bool {
                isReducedExactJacobianType(this.inputs_.JACOBIAN_FINAL_);
     }
     return isReducedExactJacobianType(this.inputs_.JACOBIAN_TYPE_);
+}
+
+proc temporalDiscretization.getReducedGammaSupportColumns(row: int,
+                                                          out upperCol: int,
+                                                          out lowerCol: int): bool {
+    const wakeFaceIndex = this.spatialDisc_.wakeFaceIndexInfluenceOnElem_[row];
+    if wakeFaceIndex > 0 && wakeFaceIndex <= this.spatialDisc_.wake_face_dom.high {
+        upperCol = this.spatialDisc_.wakeFaceUpper_[wakeFaceIndex];
+        lowerCol = this.spatialDisc_.wakeFaceLower_[wakeFaceIndex];
+        if upperCol > 0 && upperCol <= this.spatialDisc_.nelemDomain_ &&
+           lowerCol > 0 && lowerCol <= this.spatialDisc_.nelemDomain_ then
+            return true;
+    }
+    upperCol = 0;
+    lowerCol = 0;
+    return false;
+}
+
+inline proc temporalDiscretization.validateJacobianEntry(row: int,
+                                                         col: int,
+                                                         context: string) {
+    if row < 0 || row >= this.spatialDisc_.nelemDomain_ ||
+       col < 0 || col >= this.spatialDisc_.nelemDomain_ then
+        halt("Invalid Jacobian entry in ", context, ": row=", row, " col=", col,
+             " valid range=[0,", this.spatialDisc_.nelemDomain_ - 1, "]");
+}
+
+inline proc temporalDiscretization.setJacobianEntry(row: int,
+                                                    col: int,
+                                                    val: real(64),
+                                                    context: string) {
+    this.validateJacobianEntry(row, col, context);
+    this.A_petsc.set(row, col, val);
+}
+
+inline proc temporalDiscretization.addJacobianEntry(row: int,
+                                                    col: int,
+                                                    val: real(64),
+                                                    context: string) {
+    this.validateJacobianEntry(row, col, context);
+    this.A_petsc.add(row, col, val);
 }
 
 proc isWallFace(sd: borrowed spatialDiscretization, face: int): bool {
@@ -823,7 +866,7 @@ proc computeAnalyticalKuttaDerivativesOnStencil(sd: borrowed spatialDiscretizati
 }
 
 class temporalDiscretization {
-    var spatialDisc_: shared spatialDiscretization;
+    var spatialDisc_: borrowed spatialDiscretization;
     var inputs_: potentialInputs;
     var it_: int = 0;
     var t0_: real(64) = 0.0;
@@ -876,7 +919,7 @@ class temporalDiscretization {
     var kuttaStencilCacheDom: domain(1) = {0..<0};
     var kuttaStencilCache: [kuttaStencilCacheDom] int;
 
-    proc init(spatialDisc: shared spatialDiscretization, ref inputs: potentialInputs) {
+    proc init(spatialDisc: borrowed spatialDiscretization, ref inputs: potentialInputs) {
         writeln("Initializing temporal discretization...");
         this.spatialDisc_ = spatialDisc;
         this.inputs_ = inputs;
@@ -900,11 +943,25 @@ class temporalDiscretization {
             // J_red = dR/dphi - dR/dGamma * (dK/dphi)/(dK/dGamma).
             // Each row keeps its local stencil plus the Kutta row support, so
             // it needs a noticeably wider preallocation than the standard local Jacobian.
-            nnz = max(64, baseNNZ + 16);
+            if this.spatialDisc_.isIBMFlow() then
+                nnz = max(256, baseNNZ + 64);
+            else
+                nnz = max(64, baseNNZ + 16);
+        } else if this.spatialDisc_.isIBMFlow() && this.activeJacobianType() == "analytical" {
+            // IBM analytical rows linearize wall interpolation stencils and
+            // propagated local velocity support, so they are substantially
+            // wider than the body-fitted approximate pattern.
+            nnz = max(256, baseNNZ + 64);
         } else {
             nnz = baseNNZ;
         }
         A_petsc.preAllocate(nnz);
+        if this.spatialDisc_.isIBMFlow() && this.activeJacobianType() == "analytical" {
+            // IBM analytical wall linearization can widen some rows substantially
+            // on fine meshes. Allow PETSc to grow those rows instead of aborting
+            // when the conservative initial nnz estimate is exceeded.
+            A_petsc.setOption(MAT_NEW_NONZERO_ALLOCATION_ERR, false);
+        }
 
         this.ksp = new owned PETSCksp_c(PETSC_COMM_SELF, "gmres");
         this.ksp.setTolerances(inputs.GMRES_RTOL_, inputs.GMRES_ATOL_, inputs.GMRES_DTOL_, inputs.GMRES_MAXIT_);
@@ -949,7 +1006,28 @@ class temporalDiscretization {
                 for col in rowStencil do stencilSet.add(col);
                 for col in kuttaStencil do stencilSet.add(col);
                 for col in stencilSet do
-                    this.A_petsc.set(elem - 1, col - 1, 0.0);
+                    this.setJacobianEntry(elem - 1, col - 1, 0.0, "initializeJacobian row-stencil");
+            }
+
+            this.A_petsc.assemblyComplete();
+            return;
+        }
+
+        if this.spatialDisc_.isIBMFlow() && this.activeJacobianType() == "analytical" {
+            for elem in 1..this.spatialDisc_.nelemDomain_ {
+                const rowStencil = this.buildRowStencil(elem);
+                for col in rowStencil do
+                    this.setJacobianEntry(elem - 1, col - 1, 0.0,
+                                          "initializeJacobian IBM approximate row-stencil");
+
+                var upperTEinfluence = 0;
+                var lowerTEinfluence = 0;
+                if this.getReducedGammaSupportColumns(elem, upperTEinfluence, lowerTEinfluence) {
+                    this.setJacobianEntry(elem - 1, upperTEinfluence - 1, 0.0,
+                                          "initializeJacobian IBM approximate reduced-gamma upper");
+                    this.setJacobianEntry(elem - 1, lowerTEinfluence - 1, 0.0,
+                                          "initializeJacobian IBM approximate reduced-gamma lower");
+                }
             }
 
             this.A_petsc.assemblyComplete();
@@ -957,7 +1035,7 @@ class temporalDiscretization {
         }
 
         forall elem in 1..this.spatialDisc_.nelemDomain_ {
-            this.A_petsc.set(elem-1, elem-1, 0.0);
+            this.setJacobianEntry(elem - 1, elem - 1, 0.0, "initializeJacobian diagonal");
             const faces = this.spatialDisc_.mesh_.elem2edge_[this.spatialDisc_.mesh_.elem2edgeIndex_[elem] + 1 .. this.spatialDisc_.mesh_.elem2edgeIndex_[elem + 1]];
             var isWakeFace = false;
             for face in faces {
@@ -965,7 +1043,7 @@ class temporalDiscretization {
                 const elem2 = this.spatialDisc_.mesh_.edge2elem_[2, face];
                 const neighbor = if elem1 == elem then elem2 else elem1;
                 if neighbor <= this.spatialDisc_.nelemDomain_ {
-                    this.A_petsc.set(elem-1, neighbor-1, 0.0);
+                    this.setJacobianEntry(elem - 1, neighbor - 1, 0.0, "initializeJacobian face-neighbor");
                     if this.dgradX_dGamma_[neighbor] != 0.0 || this.dgradY_dGamma_[neighbor] != 0.0 {
                         isWakeFace = true;
                     }
@@ -975,12 +1053,14 @@ class temporalDiscretization {
                 }
             }
             if isWakeFace {
-                const wakeFaceIndex = this.spatialDisc_.wakeFaceIndexInfluenceOnElem_[elem];
-                const upperTE_influences = this.spatialDisc_.wakeFaceUpper_[wakeFaceIndex];
-                const lowerTE_influences = this.spatialDisc_.wakeFaceLower_[wakeFaceIndex];
-
-                this.A_petsc.set(elem-1, upperTE_influences - 1, 0.0);
-                this.A_petsc.set(elem-1, lowerTE_influences - 1, 0.0);
+                var upperTEinfluence = 0;
+                var lowerTEinfluence = 0;
+                if this.getReducedGammaSupportColumns(elem, upperTEinfluence, lowerTEinfluence) {
+                    this.setJacobianEntry(elem - 1, upperTEinfluence - 1, 0.0,
+                                          "initializeJacobian reduced-gamma upper");
+                    this.setJacobianEntry(elem - 1, lowerTEinfluence - 1, 0.0,
+                                          "initializeJacobian reduced-gamma lower");
+                }
             }
         }
 
@@ -993,31 +1073,68 @@ class temporalDiscretization {
         // stays separate from the assembly details.
         const jacobianType = this.activeJacobianType();
         if jacobianType == "ad_reduced_exact" {
-            this.computeADReducedExactJacobian();
+            if this.spatialDisc_.isIBMFlow() then
+                this.computeIBMADReducedExactJacobian();
+            else
+                this.computeADReducedExactJacobian();
             return;
         }
         if jacobianType == "analytical_reduced_exact" {
-            this.computeAnalyticalReducedExactJacobian();
+            if this.spatialDisc_.isIBMFlow() then
+                this.computeIBMAnalyticalReducedExactJacobian();
+            else
+                this.computeAnalyticalReducedExactJacobian();
             return;
         }
-        this.computeApproximateAnalyticalJacobian();
+        if this.spatialDisc_.isIBMFlow() then
+            this.computeIBMApproximateAnalyticalJacobian();
+        else
+            this.computeApproximateAnalyticalJacobian();
     }
 
-    proc initialize() {
+    proc initializeBoundaryConditionState() {
         this.spatialDisc_.initializeMetrics();
         this.spatialDisc_.initializeKuttaCells();
+        this.spatialDisc_.initializeBoundaryConditionData();
+    }
+
+    proc initializePrimalState() {
         this.spatialDisc_.initializeSolution();
         this.spatialDisc_.run();
         if this.hasReducedExactJacobianPhase() {
             this.enforceConsistentGammaForCurrentPhi();
             this.spatialDisc_.run();
         }
+    }
+
+    proc initializeExactSupport() {
         this.computeGradientSensitivity();
         this.initializeStencilCache();
         this.initializeCellVelocityTemplateCache();
         this.initializeJacobian();
-        
         this.computeJacobian();
+    }
+
+    proc initialize() {
+        this.initializeBoundaryConditionState();
+        const usesIBM = this.spatialDisc_.isIBMFlow();
+        const usesIBMReducedExact = usesIBM && isReducedExactJacobianType(this.activeJacobianType());
+
+        if usesIBMReducedExact {
+            // IBM reduced-exact needs IBM BC metadata before the primal state
+            // and exact-support caches are built.
+            this.spatialDisc_.initializeBoundaryConditionData();
+            this.initializePrimalState();
+            this.initializeExactSupport();
+        } else {
+            // Preserve the pre-existing IBM startup behavior for the non-reduced-exact
+            // exact/analytical paths.
+            this.initializePrimalState();
+            this.initializeExactSupport();
+            this.spatialDisc_.initializeBoundaryConditionData();
+            if usesIBM then
+                this.spatialDisc_.run();
+        }
 
         if this.inputs_.START_FILENAME_ != "" {
             writeln("Initializing solution from file: ", this.inputs_.START_FILENAME_);
@@ -1041,7 +1158,7 @@ class temporalDiscretization {
         }
     }
 
-    proc buildRowStencilUncached(row: int) {
+    proc buildBodyFittedRowStencilUncached(row: int) {
         var stencilSet = new set(int);
         var firstRing = new set(int);
 
@@ -1082,6 +1199,13 @@ class temporalDiscretization {
         }
         sort(stencil);
         return stencil;
+    }
+
+    proc buildRowStencilUncached(row: int) {
+        if this.spatialDisc_.isIBMFlow() &&
+           (isReducedExactJacobianType(this.activeJacobianType()) || this.activeJacobianType() == "analytical") then
+            return this.buildIBMRowStencilUncached(row);
+        return this.buildBodyFittedRowStencilUncached(row);
     }
 
     proc buildRowStencil(row: int) {

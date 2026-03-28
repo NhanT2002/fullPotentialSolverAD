@@ -427,10 +427,12 @@ proc temporalDiscretization.computeAnalyticalReducedExactJacobian() {
             const col = this.rowMergedCols[mergedIdx];
             const val = mergedVals[mergedIdx];
             if abs(val) > AD_ROW_PRINT_TOL || col == row then
-                this.A_petsc.add(row - 1, col - 1, val);
+                this.addJacobianEntry(row - 1, col - 1, val,
+                                      "computeAnalyticalReducedExactJacobian merged row entry");
         }
     }
 
     this.A_petsc.assemblyComplete();
+    // this.A_petsc.matView();
 }
 }

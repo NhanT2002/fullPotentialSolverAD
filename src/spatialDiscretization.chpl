@@ -12,6 +12,9 @@ use Time;
 use Sort;
 use leastSquaresGradient;
 import input.potentialInputs;
+use cgns;
+use CGNSextern;
+use globalParam;
 
 // config const elemID : int = 0;   // Element index for debugging purposes
 
@@ -140,6 +143,14 @@ class spatialDiscretization {
     proc updateInputs(ref newInputs: potentialInputs) {
         this.inputs_ = newInputs;
         this.farfieldIsCylinder_ = this.inputs_.FARFIELD_BC_TYPE_ == "cylinder";
+    }
+
+    proc initializeBoundaryConditionData() {
+        // Default body-fitted flow has no extra boundary metadata to load.
+    }
+
+    proc isIBMFlow(): bool {
+        return false;
     }
 
     proc initializeMetrics() {
@@ -406,99 +417,7 @@ class spatialDiscretization {
 
             }
         }
-        var wake_face_list = new list((real(64), int));
-        for face in 1..this.nface_ {
-            const elem1 = this.mesh_.edge2elem_[1, face];
-            const elem2 = this.mesh_.edge2elem_[2, face];
-            if ( (this.kuttaCell_[elem1] == 1 && this.kuttaCell_[elem2] == -1) ||
-               (this.kuttaCell_[elem1] == -1 && this.kuttaCell_[elem2] == 1) ) {
-                this.wake_dom += elem1;
-                this.wake_dom += elem2;
-                wake_face_list.pushBack((this.faceCentroidX_[face], face));
-            }
-        }
-        this.kuttaCell_ = 0;
-        sort(wake_face_list);
-        this.wake_face_dom = {1..wake_face_list.size};
-        forall i in this.wake_face_dom {
-            this.wakeFace_[i] = wake_face_list[i-1][1];
-            this.wakeFaceX_[i] = this.faceCentroidX_[this.wakeFace_[i]];
-            this.wakeFaceY_[i] = this.faceCentroidY_[this.wakeFace_[i]];
-
-            const elem1 = this.mesh_.edge2elem_[1, this.wakeFace_[i]];
-            const elem2 = this.mesh_.edge2elem_[2, this.wakeFace_[i]];
-            if this.elemCentroidY_[elem1] > this.elemCentroidY_[elem2] {
-                this.kuttaCell_[elem1] = 1;
-                this.kuttaCell_[elem2] = -1;
-                this.wakeFaceUpper_[i] = elem1;
-                this.wakeFaceLower_[i] = elem2;
-            }
-            else {
-                this.kuttaCell_[elem1] = -1;
-                this.kuttaCell_[elem2] = 1;
-                this.wakeFaceUpper_[i] = elem2;
-                this.wakeFaceLower_[i] = elem1;
-            }
-        }
-        for i in this.wake_face_dom {
-            this.wakeFace2index_[this.wakeFace_[i]] = i;
-        }
-
-        this.wakeFaceIndexInfluenceOnElem_ = -1;
-        for (i, face) in zip(this.wakeFace_.domain, this.wakeFace_) {
-            if i <= this.wakeFace_.size {
-                const elemUpper = this.wakeFaceUpper_[i];
-                const elemLower = this.wakeFaceLower_[i];
-                this.wakeFaceIndexInfluenceOnElem_[elemUpper] = 1;
-                this.wakeFaceIndexInfluenceOnElem_[elemLower] = 1;
-
-                const neighborFacesUpper = this.mesh_.elem2edge_[this.mesh_.elem2edgeIndex_[elemUpper]+1 .. this.mesh_.elem2edgeIndex_[elemUpper+1]];
-                for faceNeighbor in neighborFacesUpper {
-                    const elem1 = this.mesh_.edge2elem_[1, faceNeighbor];
-                    const elem2 = this.mesh_.edge2elem_[2, faceNeighbor];
-                    const neighborElem = if elem1 == elemUpper then elem2 else elem1;
-                    if this.kuttaCell_[neighborElem] == 0 {
-                        this.wakeFaceIndexInfluenceOnElem_[neighborElem] = 1;
-                    }
-                }
-
-                const neighborFacesLower = this.mesh_.elem2edge_[this.mesh_.elem2edgeIndex_[elemLower]+1 .. this.mesh_.elem2edgeIndex_[elemLower+1]];
-                for faceNeighbor in neighborFacesLower {
-                    const elem1 = this.mesh_.edge2elem_[1, faceNeighbor];
-                    const elem2 = this.mesh_.edge2elem_[2, faceNeighbor];
-                    const neighborElem = if elem1 == elemLower then elem2 else elem1;
-                    if this.kuttaCell_[neighborElem] == 0 {
-                        this.wakeFaceIndexInfluenceOnElem_[neighborElem] = 1;
-                    }
-                }
-            }
-            else {
-                const elemUpper = this.wakeFaceUpper_[i];
-                const elemLower = this.wakeFaceLower_[i];
-                this.wakeFaceIndexInfluenceOnElem_[elemUpper] = i-1;
-                this.wakeFaceIndexInfluenceOnElem_[elemLower] = i-1;
-
-                const neighborFacesUpper = this.mesh_.elem2edge_[this.mesh_.elem2edgeIndex_[elemUpper]+1 .. this.mesh_.elem2edgeIndex_[elemUpper+1]];
-                for faceNeighbor in neighborFacesUpper {
-                    const elem1 = this.mesh_.edge2elem_[1, faceNeighbor];
-                    const elem2 = this.mesh_.edge2elem_[2, faceNeighbor];
-                    const neighborElem = if elem1 == elemUpper then elem2 else elem1;
-                    if this.kuttaCell_[neighborElem] == 0 {
-                        this.wakeFaceIndexInfluenceOnElem_[neighborElem] = i-1;
-                    }
-                }
-
-                const neighborFacesLower = this.mesh_.elem2edge_[this.mesh_.elem2edgeIndex_[elemLower]+1 .. this.mesh_.elem2edgeIndex_[elemLower+1]];
-                for faceNeighbor in neighborFacesLower {
-                    const elem1 = this.mesh_.edge2elem_[1, faceNeighbor];
-                    const elem2 = this.mesh_.edge2elem_[2, faceNeighbor];
-                    const neighborElem = if elem1 == elemLower then elem2 else elem1;
-                    if this.kuttaCell_[neighborElem] == 0 {
-                        this.wakeFaceIndexInfluenceOnElem_[neighborElem] = i-1;
-                    }
-                }
-            }
-        }
+        this.rebuildWakeMetadataFromCurrentKuttaCells();
 
         // for elem in 1..this.nelemDomain_ {
         //     if this.wakeFaceIndexInfluenceOnElem_[elem] != -1 {
@@ -516,6 +435,71 @@ class spatialDiscretization {
 
         this.deltaSlowerTEx_ = this.TEnodeXcoord_ - this.elemCentroidX_[this.lowerTEelem_];
         this.deltaSlowerTEy_ = this.TEnodeYcoord_ - this.elemCentroidY_[this.lowerTEelem_];
+    }
+
+    proc rebuildWakeMetadataFromCurrentKuttaCells() {
+        var wake_face_list = new list((real(64), int));
+        this.wake_dom.clear();
+        this.wakeFace2index_.clear();
+
+        for face in 1..this.nface_ {
+            const elem1 = this.mesh_.edge2elem_[1, face];
+            const elem2 = this.mesh_.edge2elem_[2, face];
+            if ((this.kuttaCell_[elem1] == 1 && this.kuttaCell_[elem2] == -1) ||
+                (this.kuttaCell_[elem1] == -1 && this.kuttaCell_[elem2] == 1)) {
+                this.wake_dom += elem1;
+                this.wake_dom += elem2;
+                wake_face_list.pushBack((this.faceCentroidX_[face], face));
+            }
+        }
+
+        sort(wake_face_list);
+        this.wake_face_dom = {1..wake_face_list.size};
+        for i in this.wake_face_dom {
+            this.wakeFace_[i] = wake_face_list[i - 1][1];
+            this.wakeFaceX_[i] = this.faceCentroidX_[this.wakeFace_[i]];
+            this.wakeFaceY_[i] = this.faceCentroidY_[this.wakeFace_[i]];
+
+            const elem1 = this.mesh_.edge2elem_[1, this.wakeFace_[i]];
+            const elem2 = this.mesh_.edge2elem_[2, this.wakeFace_[i]];
+            if this.kuttaCell_[elem1] == 1 && this.kuttaCell_[elem2] == -1 {
+                this.wakeFaceUpper_[i] = elem1;
+                this.wakeFaceLower_[i] = elem2;
+            } else {
+                this.wakeFaceUpper_[i] = elem2;
+                this.wakeFaceLower_[i] = elem1;
+            }
+        }
+
+        for i in this.wake_face_dom do
+            this.wakeFace2index_[this.wakeFace_[i]] = i;
+
+        this.wakeFaceIndexInfluenceOnElem_ = -1;
+        for (i, face) in zip(this.wakeFace_.domain, this.wakeFace_) {
+            const influenceIndex = 1;
+            const elemUpper = this.wakeFaceUpper_[i];
+            const elemLower = this.wakeFaceLower_[i];
+            this.wakeFaceIndexInfluenceOnElem_[elemUpper] = influenceIndex;
+            this.wakeFaceIndexInfluenceOnElem_[elemLower] = influenceIndex;
+
+            const neighborFacesUpper = this.mesh_.elem2edge_[this.mesh_.elem2edgeIndex_[elemUpper]+1 .. this.mesh_.elem2edgeIndex_[elemUpper+1]];
+            for faceNeighbor in neighborFacesUpper {
+                const elem1 = this.mesh_.edge2elem_[1, faceNeighbor];
+                const elem2 = this.mesh_.edge2elem_[2, faceNeighbor];
+                const neighborElem = if elem1 == elemUpper then elem2 else elem1;
+                if this.kuttaCell_[neighborElem] == 0 then
+                    this.wakeFaceIndexInfluenceOnElem_[neighborElem] = influenceIndex;
+            }
+
+            const neighborFacesLower = this.mesh_.elem2edge_[this.mesh_.elem2edgeIndex_[elemLower]+1 .. this.mesh_.elem2edgeIndex_[elemLower+1]];
+            for faceNeighbor in neighborFacesLower {
+                const elem1 = this.mesh_.edge2elem_[1, faceNeighbor];
+                const elem2 = this.mesh_.edge2elem_[2, faceNeighbor];
+                const neighborElem = if elem1 == elemLower then elem2 else elem1;
+                if this.kuttaCell_[neighborElem] == 0 then
+                    this.wakeFaceIndexInfluenceOnElem_[neighborElem] = influenceIndex;
+            }
+        }
     }
 
     proc initializeSolution() {
@@ -1395,6 +1379,780 @@ class spatialDiscretization {
         fieldsWake["gammaWake"] = gammaWake;
 
         writer.writeWakeToCGNS(this.wakeFaceX_, this.wakeFaceY_, this.wakeFaceZ_, wake_dom, fieldsWake);
+    }
+}
+
+class spatialDiscretizationIBM : spatialDiscretization {
+
+    const IBMInterpCoordScale : real(64) = 1.0e12;
+    const IBMInterpCoordTol : real(64) = 1.0e-10;
+
+    /** Number of IBM wall face data entries for this zone **/
+    var numIBMData_ : int = 0;
+
+    /** Domain for IBM data arrays **/
+    var ibmDataDomain_ : domain(1) = {1..#numIBMData_};
+
+    /** Local element index of the fluid cell (L side of IBM wall face) **/
+    var ibmFluidCellIndex_ : [ibmDataDomain_] int;
+
+    /** Local element index of the ghost cell (R side of IBM wall face) **/
+    var ibmGhostCellIndex_ : [ibmDataDomain_] int;
+
+    /** Local element index of the donor cell for interpolation **/
+    var ibmDonorCellIndex_ : [ibmDataDomain_] int;
+
+    /** Zone ID of the donor cell (1-based CGNS zone ID) **/
+    var ibmDonorZoneId_ : [ibmDataDomain_] int;
+
+    /** Wall face index associated with each IBM entry **/
+    var ibmWallFaceIndex_ : [ibmDataDomain_] int = -1;
+
+    /** Wall point coordinates for each IBM wall face **/
+    var ibmWallPointX_ : [ibmDataDomain_] real(64);
+    var ibmWallPointY_ : [ibmDataDomain_] real(64);
+
+    /** Image point coordinates for each IBM wall face **/
+    var ibmImagePointX_ : [ibmDataDomain_] real(64);
+    var ibmImagePointY_ : [ibmDataDomain_] real(64);
+
+    /** Surface normal at wall point for each IBM wall face **/
+    var ibmNormalX_ : [ibmDataDomain_] real(64);
+    var ibmNormalY_ : [ibmDataDomain_] real(64);
+
+    /** Vector from donor cell center to image point **/
+    var ibmDonorToImageVectorX_ : [ibmDataDomain_] real(64);
+    var ibmDonorToImageVectorY_ : [ibmDataDomain_] real(64);
+
+    /** Distance from ghost cell center to donor cell center **/
+    var ibmDonorDistance_ : [ibmDataDomain_] real(64);
+
+    /** Distance from ghost cell center to wall **/
+    var ibmWallDistance_ : [ibmDataDomain_] real(64);
+
+    /** Vector from wall point to image point **/
+    var ibmWallToImageVectorX_ : [ibmDataDomain_] real(64);
+    var ibmWallToImageVectorY_ : [ibmDataDomain_] real(64);
+    var ibmWallToImageSignedDistance_ : [ibmDataDomain_] real(64);
+
+    /** Vector from wall point to ghost cell center **/
+    var ibmWallToGhostVectorX_ : [ibmDataDomain_] real(64);
+    var ibmWallToGhostVectorY_ : [ibmDataDomain_] real(64);
+    var ibmWallToGhostSignedDistance_ : [ibmDataDomain_] real(64);
+
+    var uWall_ : [ibmDataDomain_] real(64);
+    var vWall_ : [ibmDataDomain_] real(64);
+    var wWall_ : [ibmDataDomain_] real(64);
+    var rhoWall_ : [ibmDataDomain_] real(64);
+    var machWall_ : [ibmDataDomain_] real(64);
+    var cpWall_ : [ibmDataDomain_] real(64);
+
+    /** Domain for precomputed IBM interpolation stencils (fixed width of 8). **/
+    var ibmInterpStencilDomain_ : domain(2) = {1..#numIBMData_, 1..4};
+
+    /** Local cell indices used by the IBM interpolation stencil. **/
+    var ibmInterpStencilCellIndex_ : [ibmInterpStencilDomain_] int = -1;
+
+    /** Precomputed IBM interpolation weights. **/
+    var ibmInterpStencilWeight_ : [ibmInterpStencilDomain_] real(64) = 0.0;
+
+    /** Number of active stencil points (4 for bilinear, 8 for trilinear). **/
+    var ibmInterpStencilSize_ : [ibmDataDomain_] int = 0;
+
+    /** Fast IBM lookup tables used by the exact Jacobian path. **/
+    var ibmWallFaceToEntry_ : [face_dom] int = -1;
+    var ibmGhostCellToEntry_ : [elem_dom] int = -1;
+    var ibmInitialized_ : bool = false;
+    var ibmTrailingEdgeLoaded_ : bool = false;
+
+    proc init(Mesh: shared MeshData, ref inputs: potentialInputs) {
+        super.init(Mesh, inputs);
+    }
+
+    override proc initializeBoundaryConditionData() {
+        if !this.ibmInitialized_ then
+            this.initializeIBM();
+    }
+
+    override proc isIBMFlow(): bool {
+        return true;
+    }
+
+    proc initializeIBM() {
+        if this.ibmInitialized_ then
+            return;
+        readIBMData(this.inputs_.GRID_FILENAME_);
+        readIBMTrailingEdgeFromGrid(this.inputs_.GRID_FILENAME_);
+        buildIBMInterpolationStencils();
+        if this.usesReducedExactJacobian() {
+            this.rebuildWakeMetadataFromCurrentKuttaCells();
+            validateIBMExactConfiguration();
+        }
+        this.ibmInitialized_ = true;
+    }
+
+    proc readIBMData(filename: string) {
+        var cgnsFile : owned CGNSfile_c = new owned CGNSfile_c(filename, CGNSOpenMode_t.READ);
+        const baseName : string = cgnsFile.baseName_;
+        const zoneName : string = "Zone00001";
+        const zoneId : c_int = cgnsFile.getZoneId(cgnsFile.baseId_, zoneName);
+        const zonePath : string = "/" + baseName + "/" + zoneName;
+
+        var kuttaBuf : [0..<this.nelem_] real(64);
+        const hasKuttaCell = cgnsFile.readFieldSolution(cgnsFile.baseId_, zoneId, "FlowSolution#Centers", "KuttaCell", kuttaBuf);
+        if hasKuttaCell
+        {
+            for elem in 1..this.nelem_ do this.kuttaCell_[elem] = kuttaBuf[elem-1] : int;
+        }
+        else
+        {
+            for elem in 1..this.nelem_ do this.kuttaCell_[elem] = 0;
+        }
+
+
+        var ibmDataPath : string = zonePath + "/IBMData";
+        var nArrays : c_int = cgnsFile.getNumberOfArraysInNode(ibmDataPath);
+        var (firstName, firstRank, firstType, firstSize) = cgnsFile.getArrayInfoFromNode(ibmDataPath, 1);
+        var n : int = firstSize[0] : int;
+
+        this.numIBMData_ = n;
+        this.ibmDataDomain_ = {1..n};
+        this.ibmInterpStencilDomain_ = {1..n, 1..4};
+        this.ibmInterpStencilCellIndex_ = -1;
+        this.ibmInterpStencilWeight_ = 0.0;
+        this.ibmInterpStencilSize_ = 0;
+        this.ibmWallFaceIndex_ = -1;
+
+        // Read all arrays
+        var fluidCellIdx : [0..#n] int;
+        var donorCellIdx : [0..#n] int;
+        var donorZoneId  : [0..#n] int;
+        var wallPointX   : [0..#n] real(64);
+        var wallPointY   : [0..#n] real(64);
+        var imagePointX  : [0..#n] real(64);
+        var imagePointY  : [0..#n] real(64);
+        var normalX      : [0..#n] real(64);
+        var normalY      : [0..#n] real(64);
+        var donorDist    : [0..#n] real(64);
+        var wallDist     : [0..#n] real(64);
+
+        var arrayNames : [0..#(nArrays:int)] string = cgnsFile.getNamesOfArraysInNode(ibmDataPath);
+
+        for arrayId in 1..nArrays:int {
+            var name : string = arrayNames[arrayId - 1];
+
+            select name {
+                when "FluidCellIndex"   do cgnsFile.getArrayFromNode(ibmDataPath, arrayId, fluidCellIdx);
+                when "DonorCellIndex"   do cgnsFile.getArrayFromNode(ibmDataPath, arrayId, donorCellIdx);
+                when "DonorZoneId"      do cgnsFile.getArrayFromNode(ibmDataPath, arrayId, donorZoneId);
+                when "WallPointX"       do cgnsFile.getArrayFromNode(ibmDataPath, arrayId, wallPointX);
+                when "WallPointY"       do cgnsFile.getArrayFromNode(ibmDataPath, arrayId, wallPointY);
+                when "ImagePointX"      do cgnsFile.getArrayFromNode(ibmDataPath, arrayId, imagePointX);
+                when "ImagePointY"      do cgnsFile.getArrayFromNode(ibmDataPath, arrayId, imagePointY);
+                when "NormalX"          do cgnsFile.getArrayFromNode(ibmDataPath, arrayId, normalX);
+                when "NormalY"          do cgnsFile.getArrayFromNode(ibmDataPath, arrayId, normalY);
+                when "DonorDistance"     do cgnsFile.getArrayFromNode(ibmDataPath, arrayId, donorDist);
+                when "WallDistance"      do cgnsFile.getArrayFromNode(ibmDataPath, arrayId, wallDist);
+                otherwise
+                    writeln("  WARNING: Unknown IBMData array: ", name);
+            }
+        }
+        
+        // Link each ghost cell to its corresponding fluid cell
+        var fluidCell2GhostCellMap = new map(int, list(int));
+        var fluidCell2GhostCellCountMap = new map(int, int);
+        for face in this.mesh_.edgeWall_ {
+            const elem1 = this.mesh_.edge2elem_[1, face];
+            const elem2 = this.mesh_.edge2elem_[2, face];
+            // Determine which element is interior
+            const (interiorElem, ghostElem) = 
+                if elem1 <= this.nelemDomain_ then (elem1, elem2) else (elem2, elem1);
+            fluidCell2GhostCellMap[interiorElem].pushBack(ghostElem);
+            fluidCell2GhostCellCountMap[interiorElem] += 1;
+        }
+        
+        // Populate zone IBM data arrays
+        for i in this.ibmDataDomain_
+        {
+            this.ibmFluidCellIndex_[i] = fluidCellIdx[i-1] + 1; // Convert to 1-based indexing
+            this.ibmDonorCellIndex_[i] = donorCellIdx[i-1] + 1; // Convert to 1-based indexing
+            this.ibmDonorZoneId_[i]    = donorZoneId[i-1];
+            this.ibmWallPointX_[i] = wallPointX[i-1];
+            this.ibmWallPointY_[i] = wallPointY[i-1];
+            this.ibmImagePointX_[i] = imagePointX[i-1];
+            this.ibmImagePointY_[i] = imagePointY[i-1];
+            this.ibmNormalX_[i] = normalX[i-1];
+            this.ibmNormalY_[i] = normalY[i-1];
+            this.ibmDonorDistance_[i]   = donorDist[i-1];
+            this.ibmWallDistance_[i]    = wallDist[i-1];
+            this.ibmDonorToImageVectorX_[i] = this.ibmImagePointX_[i] - this.elemCentroidX_[this.ibmDonorCellIndex_[i]];
+            this.ibmDonorToImageVectorY_[i] = this.ibmImagePointY_[i] - this.elemCentroidY_[this.ibmDonorCellIndex_[i]];
+            this.ibmGhostCellIndex_[i] = try! fluidCell2GhostCellMap[this.ibmFluidCellIndex_[i]][0];
+            this.ibmWallToImageVectorX_[i] = this.ibmImagePointX_[i] - this.ibmWallPointX_[i];
+            this.ibmWallToImageVectorY_[i] = this.ibmImagePointY_[i] - this.ibmWallPointY_[i];
+            this.ibmWallToImageSignedDistance_[i] = this.ibmWallToImageVectorX_[i] * this.ibmNormalX_[i] + this.ibmWallToImageVectorY_[i] * this.ibmNormalY_[i];
+            
+            try
+            {
+                if fluidCell2GhostCellCountMap[this.ibmFluidCellIndex_[i]] > 1
+                {
+                    // To choose the right ghost cell in this case, we iterate over the neighbor of the fluid cell and find the one that matches the wall point and normal direction the best
+                    const wallPointX = this.ibmWallPointX_[i];
+                    const wallPointY = this.ibmWallPointY_[i];
+                    const normalX = this.ibmNormalX_[i];
+                    const normalY = this.ibmNormalY_[i];
+                    for ghostCellIndex in fluidCell2GhostCellMap[this.ibmFluidCellIndex_[i]]
+                    {
+                        const ghostCellCenterX = this.elemCentroidX_[ghostCellIndex];
+                        const ghostCellCenterY = this.elemCentroidY_[ghostCellIndex];
+                        var ghost2WallVectorX = wallPointX - ghostCellCenterX;
+                        var ghost2WallVectorY = wallPointY - ghostCellCenterY;
+                        const ghost2WallVectorMag = sqrt(ghost2WallVectorX * ghost2WallVectorX + ghost2WallVectorY * ghost2WallVectorY);
+                        ghost2WallVectorX /= ghost2WallVectorMag;
+                        ghost2WallVectorY /= ghost2WallVectorMag;
+                        // check if ghost2WallVector is close to normal
+                        const error = sqrt((ghost2WallVectorX - normalX)**2 + (ghost2WallVectorY - normalY)**2);
+                        if error < 1e-6
+                        {
+                            this.ibmGhostCellIndex_[i] = ghostCellIndex;
+                            break;
+                        }
+                    }
+                }   
+            }
+            catch e
+            {
+                writeln("Error reading zone ", zoneName);
+            }
+            this.ibmWallToGhostVectorX_[i] = this.elemCentroidX_[this.ibmGhostCellIndex_[i]] - this.ibmWallPointX_[i];
+            this.ibmWallToGhostVectorY_[i] = this.elemCentroidY_[this.ibmGhostCellIndex_[i]] - this.ibmWallPointY_[i];
+            this.ibmWallToGhostSignedDistance_[i] = this.ibmWallToGhostVectorX_[i] * this.ibmNormalX_[i] + this.ibmWallToGhostVectorY_[i] * this.ibmNormalY_[i];
+        }
+
+        this.buildIBMEntryLookupMaps();
+
+        // // Sample first 10 entries for debugging
+        // for i in 1..min(10, n) {
+        //     writeln("IBM Data Entry ", i, ":");
+        //     writeln("  Fluid Cell Index: ", this.ibmFluidCellIndex_[i]);
+        //     writeln("  Ghost Cell Index: ", this.ibmGhostCellIndex_[i], " centroid : ", this.elemCentroidX_[this.ibmGhostCellIndex_[i]], ", ", this.elemCentroidY_[this.ibmGhostCellIndex_[i]]);
+        //     writeln("  Donor Cell Index: ", this.ibmDonorCellIndex_[i]);
+        //     writeln("  Donor Zone ID: ", this.ibmDonorZoneId_[i]);
+        //     writeln("  Wall Point: (", this.ibmWallPointX_[i], ", ", this.ibmWallPointY_[i], ")");
+        //     writeln("  Image Point: (", this.ibmImagePointX_[i], ", ", this.ibmImagePointY_[i], ")");
+        //     writeln("  Normal Vector: (", this.ibmNormalX_[i], ", ", this.ibmNormalY_[i], ")");
+        //     writeln("  Donor to Image Vector: (", this.ibmDonorToImageVectorX_[i], ", ", this.ibmDonorToImageVectorY_[i], ")");
+        //     writeln("  Donor Distance: ", this.ibmDonorDistance_[i]);
+        //     writeln("  Wall Distance: ", this.ibmWallDistance_[i]);
+        //     writeln("  Wall to Image Vector: (", this.ibmWallToImageVectorX_[i], ", ", this.ibmWallToImageVectorY_[i], "), Signed Distance: ", this.ibmWallToImageSignedDistance_[i]);
+        //     writeln("  Wall to Ghost Vector: (", this.ibmWallToGhostVectorX_[i], ", ", this.ibmWallToGhostVectorY_[i], "), Signed Distance: ", this.ibmWallToGhostSignedDistance_[i]);
+        // }
+
+        writeln("  Zone ", zoneName, ": read ", n, " IBM wall face data entries");
+
+    }
+
+    proc usesReducedExactJacobian(): bool {
+        return this.inputs_.JACOBIAN_TYPE_ == "ad_reduced_exact" ||
+               this.inputs_.JACOBIAN_START_ == "ad_reduced_exact" ||
+               this.inputs_.JACOBIAN_FINAL_ == "ad_reduced_exact" ||
+               this.inputs_.JACOBIAN_TYPE_ == "analytical_reduced_exact" ||
+               this.inputs_.JACOBIAN_START_ == "analytical_reduced_exact" ||
+               this.inputs_.JACOBIAN_FINAL_ == "analytical_reduced_exact";
+    }
+
+    proc buildIBMEntryLookupMaps() {
+        this.ibmWallFaceToEntry_ = -1;
+        this.ibmGhostCellToEntry_ = -1;
+
+        var wallPairToFace = new map((int, int), int);
+        for face in this.mesh_.edgeWall_ {
+            const elem1 = this.mesh_.edge2elem_[1, face];
+            const elem2 = this.mesh_.edge2elem_[2, face];
+            const (interiorElem, ghostElem) =
+                if elem1 <= this.nelemDomain_ then (elem1, elem2) else (elem2, elem1);
+            wallPairToFace[(interiorElem, ghostElem)] = face;
+        }
+
+        for ibmIndex in this.ibmDataDomain_ {
+            const fluidCell = this.ibmFluidCellIndex_[ibmIndex];
+            const ghostCell = this.ibmGhostCellIndex_[ibmIndex];
+            const wallPair = (fluidCell, ghostCell);
+            if !wallPairToFace.contains(wallPair) then
+                halt("IBM entry ", ibmIndex, " does not match any wall face for fluid cell ",
+                     fluidCell, " and ghost cell ", ghostCell);
+
+            const wallFace = try! wallPairToFace[wallPair];
+            this.ibmWallFaceIndex_[ibmIndex] = wallFace;
+
+            if this.ibmWallFaceToEntry_[wallFace] > 0 then
+                halt("Wall face ", wallFace, " maps to more than one IBM entry");
+            if this.ibmGhostCellToEntry_[ghostCell] > 0 then
+                halt("Ghost cell ", ghostCell, " maps to more than one IBM entry");
+
+            this.ibmWallFaceToEntry_[wallFace] = ibmIndex;
+            this.ibmGhostCellToEntry_[ghostCell] = ibmIndex;
+        }
+    }
+
+    proc validateIBMExactConfiguration() {
+        if !this.usesReducedExactJacobian() then
+            return;
+
+        if !this.ibmTrailingEdgeLoaded_ then
+            halt("IBM exact Jacobian requires IBMTrailingEdge data in the grid file");
+
+        for ibmIndex in this.ibmDataDomain_ {
+            if this.ibmDonorZoneId_[ibmIndex] != 1 then
+                halt("IBM exact Jacobian currently supports only single-zone donor stencils. ",
+                     "IBM entry ", ibmIndex, " references donor zone ", this.ibmDonorZoneId_[ibmIndex]);
+            if this.ibmInterpStencilSize_[ibmIndex] <= 0 then
+                halt("IBM exact Jacobian found an empty interpolation stencil at entry ", ibmIndex);
+            for stencilIndex in 1..this.ibmInterpStencilSize_[ibmIndex] {
+                const cellIndex = this.ibmInterpStencilCellIndex_[ibmIndex, stencilIndex];
+                if cellIndex <= 0 || cellIndex > this.nelemDomain_ then
+                    halt("IBM exact Jacobian requires local interior stencil cells. Entry ", ibmIndex,
+                         " uses invalid stencil cell ", cellIndex);
+            }
+        }
+    }
+
+    proc getIBMEntryForWallFace(face: int): int {
+        if face < this.face_dom.low || face > this.face_dom.high then
+            return -1;
+        return this.ibmWallFaceToEntry_[face];
+    }
+
+    proc getIBMEntryForGhostCell(ghostCell: int): int {
+        if ghostCell < this.elem_dom.low || ghostCell > this.elem_dom.high then
+            return -1;
+        return this.ibmGhostCellToEntry_[ghostCell];
+    }
+
+    proc buildIBMInterpolationStencils() {
+        forall ibmIndex in this.ibmDataDomain_ {
+            const donorCellIndex = this.ibmDonorCellIndex_[ibmIndex];
+            const donorCenterX = this.elemCentroidX_[donorCellIndex];
+            const donorCenterY = this.elemCentroidY_[donorCellIndex];
+            const imagePointX = this.ibmImagePointX_[ibmIndex];
+            const imagePointY = this.ibmImagePointY_[ibmIndex];
+
+            var centerToCell = new map((int, int), int);
+            var xCoordMap = new map(int, real(64));
+            var yCoordMap = new map(int, real(64)); 
+
+            const donorKeyX = this.quantizeIBMCoord(donorCenterX);
+            const donorKeyY = this.quantizeIBMCoord(donorCenterY);
+            const donorCellKey = (donorKeyX, donorKeyY);
+            centerToCell[donorCellKey] = donorCellIndex;
+            xCoordMap[donorKeyX] = donorCenterX;
+            yCoordMap[donorKeyY] = donorCenterY;
+            
+            const neighbors = this.mesh_.esuel_[this.mesh_.esuelIndex_[donorCellIndex] + 1 
+                                                                .. this.mesh_.esuelIndex_[donorCellIndex + 1]];
+            for cellIndex in neighbors {
+                const centerX = this.elemCentroidX_[cellIndex];
+                const centerY = this.elemCentroidY_[cellIndex];
+                const keyX = this.quantizeIBMCoord(centerX);
+                const keyY = this.quantizeIBMCoord(centerY);
+                const cellKey = (keyX, keyY);
+                centerToCell[cellKey] = cellIndex;
+                if !xCoordMap.contains(keyX) then xCoordMap[keyX] = centerX;
+                if !yCoordMap.contains(keyY) then yCoordMap[keyY] = centerY;
+
+                const neighbors2 = this.mesh_.esuel_[this.mesh_.esuelIndex_[cellIndex] + 1 
+                                                                .. this.mesh_.esuelIndex_[cellIndex + 1]];
+                for cellIndex2 in neighbors2 {
+                    const centerX2 = this.elemCentroidX_[cellIndex2];
+                    const centerY2 = this.elemCentroidY_[cellIndex2];
+                    const keyX2 = this.quantizeIBMCoord(centerX2);
+                    const keyY2 = this.quantizeIBMCoord(centerY2);
+                    const cellKey2 = (keyX2, keyY2);
+                    if !centerToCell.contains(cellKey2) {
+                        centerToCell[cellKey2] = cellIndex2;
+                        if !xCoordMap.contains(keyX2) then xCoordMap[keyX2] = centerX2;
+                        if !yCoordMap.contains(keyY2) then yCoordMap[keyY2] = centerY2;
+                    }
+
+                    const neighbors3 = this.mesh_.esuel_[this.mesh_.esuelIndex_[cellIndex2] + 1 
+                                                                    .. this.mesh_.esuelIndex_[cellIndex2 + 1]];
+                    for cellIndex3 in neighbors3 {
+                        const centerX3 = this.elemCentroidX_[cellIndex3];
+                        const centerY3 = this.elemCentroidY_[cellIndex3];
+                        const keyX3 = this.quantizeIBMCoord(centerX3);
+                        const keyY3 = this.quantizeIBMCoord(centerY3);
+                        const cellKey3 = (keyX3, keyY3);
+                        if !centerToCell.contains(cellKey3) {
+                            centerToCell[cellKey3] = cellIndex3;
+                            if !xCoordMap.contains(keyX3) then xCoordMap[keyX3] = centerX3;
+                            if !yCoordMap.contains(keyY3) then yCoordMap[keyY3] = centerY3;
+                        }
+                    }
+                }
+            }   
+
+            const xCoords = extractSortedCoordValues(xCoordMap);
+            const yCoords = extractSortedCoordValues(yCoordMap);
+
+            for stencilIndex in 1..4 {
+                this.ibmInterpStencilCellIndex_[ibmIndex, stencilIndex] = -1;
+                this.ibmInterpStencilWeight_[ibmIndex, stencilIndex] = 0.0;
+            }
+            this.ibmInterpStencilSize_[ibmIndex] = 0;
+
+            const (xLower, xUpper) = getBracketCoordinates(xCoords, imagePointX, "x", ibmIndex);
+            const (yLower, yUpper) = getBracketCoordinates(yCoords, imagePointY, "y", ibmIndex);
+            const dx = xUpper - xLower;
+            const dy = yUpper - yLower;
+
+            if abs(dx) <= IBMInterpCoordTol || abs(dy) <= IBMInterpCoordTol then
+            halt("Degenerate bilinear/trilinear stencil extents for IBM entry ", ibmIndex,
+                 " (dx=", dx, ", dy=", dy, ")");
+
+
+            const xi = validateNormalizedCoordinate((imagePointX - xLower) / dx, "xi", ibmIndex);
+            const eta = validateNormalizedCoordinate((imagePointY - yLower) / dy, "eta", ibmIndex);
+
+            const cellKeys : [1..4] (int, int) = [
+                (quantizeIBMCoord(xLower), quantizeIBMCoord(yLower)),
+                (quantizeIBMCoord(xUpper), quantizeIBMCoord(yLower)),
+                (quantizeIBMCoord(xLower), quantizeIBMCoord(yUpper)),
+                (quantizeIBMCoord(xUpper), quantizeIBMCoord(yUpper))
+            ];
+            const weights : [1..4] real(64) = [
+                (1.0 - xi) * (1.0 - eta),
+                xi * (1.0 - eta),
+                (1.0 - xi) * eta,
+                xi * eta
+            ];
+
+            var weightSum : real(64) = 0.0;
+            for stencilIndex in 1..4 {
+                this.ibmInterpStencilWeight_[ibmIndex, stencilIndex] = weights[stencilIndex];
+                this.ibmInterpStencilCellIndex_[ibmIndex, stencilIndex] = try! centerToCell[cellKeys[stencilIndex]];
+                weightSum += weights[stencilIndex];
+            }
+
+            if abs(weightSum - 1.0) > 1e-6 then
+                halt("Invalid IBM interpolation weights for IBM entry ", ibmIndex, " (sum=", weightSum, ")");
+            
+            this.ibmInterpStencilSize_[ibmIndex] = 4;
+        }
+
+        // // Sample first 10 stencils for debugging
+        // for ibmIndex in 1..min(10, this.numIBMData_) {
+        //     writeln("IBM Interpolation Stencil for IBM Entry ", ibmIndex, ":");
+        //     for stencilIndex in 1..this.ibmInterpStencilSize_[ibmIndex] {
+        //         const cellIndex = this.ibmInterpStencilCellIndex_[ibmIndex, stencilIndex];
+        //         const weight = this.ibmInterpStencilWeight_[ibmIndex, stencilIndex];
+        //         writeln("  Stencil Point ", stencilIndex, ": Cell Index = ", cellIndex, ", Weight = ", weight);
+        //     }
+        // }
+    }
+
+    inline proc quantizeIBMCoord(value : real(64)) : int
+    {
+        return round(value * IBMInterpCoordScale) : int;
+    }
+
+    proc extractSortedCoordValues(ref coordMap : map(int, real(64)))
+    {
+        const n = coordMap.size;
+        var keysDomain : domain(1) = {0..#n};
+        var keys : [keysDomain] int;
+        var coordValues : [keysDomain] real(64);
+        var idx : int = 0;
+
+        for key in coordMap.keys()
+        {
+            keys[idx] = key;
+            idx += 1;
+        }
+
+        sort(keys);
+        for i in keysDomain do coordValues[i] = try! coordMap[keys[i]];
+        return coordValues;
+    }
+
+    proc getBracketCoordinates(sortedCoords : [] real(64), imageCoord : real(64),
+                                   axisName : string, ibmIndex : int) : (real(64), real(64))
+    {
+        const firstIndex = sortedCoords.domain.low;
+        const lastIndex = sortedCoords.domain.high;
+        if firstIndex == lastIndex then
+            halt("Only one ", axisName, " coordinate plane exists for IBM entry ", ibmIndex);
+
+        if imageCoord < sortedCoords[firstIndex] - IBMInterpCoordTol ||
+        imageCoord > sortedCoords[lastIndex] + IBMInterpCoordTol then
+            halt("Image ", axisName, " coordinate ", imageCoord,
+                " lies outside the available Cartesian planes for IBM entry ", ibmIndex);
+
+        for idx in (firstIndex + 1)..lastIndex
+        {
+            const lowerCoord = sortedCoords[idx - 1];
+            const upperCoord = sortedCoords[idx];
+            if imageCoord <= upperCoord + IBMInterpCoordTol then
+                return (lowerCoord, upperCoord);
+        }
+
+        return (sortedCoords[lastIndex - 1], sortedCoords[lastIndex]);
+    }
+
+    proc validateNormalizedCoordinate(value : real(64), axisName : string, ibmIndex : int) : real(64)
+    {
+        if value < -IBMInterpCoordTol || value > 1.0 + IBMInterpCoordTol then
+            halt("Normalized coordinate ", axisName, "=", value,
+                " lies outside [0,1] for IBM entry ", ibmIndex);
+        return min(max(value, 0.0), 1.0);
+    }
+
+    proc readIBMTrailingEdgeFromGrid(filename : string) {
+        var cgnsFile : owned CGNSfile_c = new owned CGNSfile_c(filename, CGNSOpenMode_t.READ);
+        const baseName : string = cgnsFile.baseName_;
+        const basePath : string = "/" + baseName;
+        const tePath : string = basePath + "/IBMTrailingEdge";
+
+        if !cgnsFile.containsNode(tePath)
+        {
+            this.ibmTrailingEdgeLoaded_ = false;
+            writeln("Reading IBM trailing-edge data from grid file...skipped (no IBMTrailingEdge node)");
+            return;
+        }
+
+        var tePointX = 0.0;
+        var tePointY = 0.0;
+        var teWallPointX = 0.0;
+        var teWallPointY = 0.0;
+        var teUpperDeltaX = 0.0;
+        var teUpperDeltaY = 0.0;
+        var teLowerDeltaX = 0.0;
+        var teLowerDeltaY = 0.0;
+        var teUpperLocalCellIndex : int = -1;
+        var teLowerLocalCellIndex : int = -1;
+
+        const nArrays = cgnsFile.getNumberOfArraysInNode(tePath);
+        for arrayId in 1..nArrays:int
+        {
+            var (name, rank, aType, aSize) = cgnsFile.getArrayInfoFromNode(tePath, arrayId);
+            select name
+            {
+                when "TEPointX"
+                {
+                    var buf : [0..#1] real_t;
+                    cgnsFile.getArrayFromNode(tePath, arrayId, buf);
+                    tePointX = buf[0];
+                }
+                when "TEPointY"
+                {
+                    var buf : [0..#1] real_t;
+                    cgnsFile.getArrayFromNode(tePath, arrayId, buf);
+                    tePointY = buf[0];
+                }
+                when "TEWallPointX"
+                {
+                    var buf : [0..#1] real_t;
+                    cgnsFile.getArrayFromNode(tePath, arrayId, buf);
+                    teWallPointX = buf[0];
+                }
+                when "TEWallPointY"
+                {
+                    var buf : [0..#1] real_t;
+                    cgnsFile.getArrayFromNode(tePath, arrayId, buf);
+                    teWallPointY = buf[0];
+                }
+                when "TEUpperDeltaX"
+                {
+                    var buf : [0..#1] real_t;
+                    cgnsFile.getArrayFromNode(tePath, arrayId, buf);
+                    teUpperDeltaX = buf[0];
+                }
+                when "TEUpperDeltaY"
+                {
+                    var buf : [0..#1] real_t;
+                    cgnsFile.getArrayFromNode(tePath, arrayId, buf);
+                    teUpperDeltaY = buf[0];
+                }
+                when "TELowerDeltaX"
+                {
+                    var buf : [0..#1] real_t;
+                    cgnsFile.getArrayFromNode(tePath, arrayId, buf);
+                    teLowerDeltaX = buf[0];
+                }
+                when "TELowerDeltaY"
+                {
+                    var buf : [0..#1] real_t;
+                    cgnsFile.getArrayFromNode(tePath, arrayId, buf);
+                    teLowerDeltaY = buf[0];
+                }
+                when "TEUpperLocalCellIndex"
+                {
+                    var buf : [0..#1] int;
+                    cgnsFile.getArrayFromNode(tePath, arrayId, buf);
+                    teUpperLocalCellIndex = buf[0] + 1; // Convert to 1-based indexing
+                }
+                when "TELowerLocalCellIndex"
+                {
+                    var buf : [0..#1] int;
+                    cgnsFile.getArrayFromNode(tePath, arrayId, buf);
+                    teLowerLocalCellIndex = buf[0] + 1; // Convert to 1-based indexing
+                }
+                otherwise do continue;
+            }
+        }
+
+        this.TEnodeXcoord_ = teWallPointX;
+        this.TEnodeYcoord_ = teWallPointY;
+        this.upperTEelem_ = teUpperLocalCellIndex;
+        this.lowerTEelem_ = teLowerLocalCellIndex;
+        this.deltaSupperTEx_ = teUpperDeltaX;
+        this.deltaSupperTEy_ = teUpperDeltaY;
+        this.deltaSlowerTEx_ = teLowerDeltaX;
+        this.deltaSlowerTEy_ = teLowerDeltaY;
+        this.ibmTrailingEdgeLoaded_ = true;
+
+        writeln("Read IBM trailing-edge data from grid file:");
+        writeln("  TE Point: (", tePointX, ", ", tePointY, ")");
+        writeln("  TE Wall Point: (", teWallPointX, ", ", teWallPointY, ")");
+        writeln("  TE Upper Delta: (", teUpperDeltaX, ", ", teUpperDeltaY, ")");
+        writeln("  TE Lower Delta: (", teLowerDeltaX, ", ", teLowerDeltaY, ")");
+        writeln("  TE Upper Local Cell Index: ", teUpperLocalCellIndex);
+        writeln("  TE Lower Local Cell Index: ", teLowerLocalCellIndex);
+    }
+
+
+    override proc updateGhostCellsPhi() {
+        forall i in this.ibmDataDomain_ {
+            const ghostCellIndex = this.ibmGhostCellIndex_[i];
+            var interpolatedPhi : real(64) = 0.0;
+            for stencilIndex in 1..this.ibmInterpStencilSize_[i] {
+                const cellIndex = this.ibmInterpStencilCellIndex_[i, stencilIndex];
+                const weight = this.ibmInterpStencilWeight_[i, stencilIndex];
+                interpolatedPhi += weight * this.phi_[cellIndex];
+            }
+            this.phi_[ghostCellIndex] = interpolatedPhi;
+        }
+
+        inline proc updateFarfieldGhostPhi(face: int) {
+            const elem1 = this.mesh_.edge2elem_[1, face];
+            const elem2 = this.mesh_.edge2elem_[2, face];
+            
+            // Determine which element is interior and which is ghost
+            const (interiorElem, ghostElem) = 
+                if elem1 <= this.nelemDomain_ then (elem1, elem2) else (elem2, elem1);
+
+            const x = this.elemCentroidX_[ghostElem];
+            const y = this.elemCentroidY_[ghostElem];
+            
+            if this.inputs_.FARFIELD_BC_TYPE_ == "cylinder" {
+                // Analytical cylinder solution: φ = U_∞ * (r + R²/r) * cos(θ)
+                // where R is the cylinder radius
+                const R = this.inputs_.CYLINDER_RADIUS_;
+                const r2 = x*x + y*y;
+                const r = sqrt(r2);
+                const theta = atan2(y, x);
+                this.phi_[ghostElem] = this.inputs_.VEL_INF_ * (r + R*R/r) * cos(theta);
+            }
+            else {
+                // Default freestream BC
+                this.phi_[ghostElem] = this.inputs_.U_INF_ * x + this.inputs_.V_INF_ * y;
+            }
+        }
+
+        forall face in this.mesh_.edgeFarfield_ do updateFarfieldGhostPhi(face);
+    }
+
+    override proc updateGhostCellsVelocity() {
+        forall i in this.ibmDataDomain_ {
+            const ghostCellIndex = this.ibmGhostCellIndex_[i];
+            const normalX = this.ibmNormalX_[i];
+            const normalY = this.ibmNormalY_[i];
+            const alpha = this.ibmWallToGhostSignedDistance_[i];
+            const beta = this.ibmWallToImageSignedDistance_[i];
+            var imageVelocityX : real(64) = 0.0;
+            var imageVelocityY : real(64) = 0.0;
+            for stencilIndex in 1..this.ibmInterpStencilSize_[i] {
+                const cellIndex = this.ibmInterpStencilCellIndex_[i, stencilIndex];
+                const weight = this.ibmInterpStencilWeight_[i, stencilIndex];
+                imageVelocityX += weight * this.uu_[cellIndex];
+                imageVelocityY += weight * this.vv_[cellIndex];
+            }
+
+            const normalVelImage = imageVelocityX * normalX + imageVelocityY * normalY;
+            var tangentX = imageVelocityX - normalVelImage * normalX;
+            var tangentY = imageVelocityY - normalVelImage * normalY;
+            const tangentMag = sqrt(tangentX * tangentX + tangentY * tangentY);
+            tangentX /= tangentMag;
+            tangentY /= tangentMag;
+
+            const tangentVelImage = imageVelocityX * tangentX + imageVelocityY * tangentY;
+
+            const normalVelGhost = alpha / beta * normalVelImage;
+            const tangentVelGhost = tangentVelImage;
+
+            this.uu_[ghostCellIndex] = normalVelGhost * normalX + tangentVelGhost * tangentX;
+            this.vv_[ghostCellIndex] = normalVelGhost * normalY + tangentVelGhost * tangentY;
+        
+            // writeln("ibmIndex=", i, ": ghostCellIndex=", ghostCellIndex, ", normalX=", normalX, ", normalY=", normalY,
+            //         ", alpha=", alpha, ", beta=", beta, ", imageVelocity=(", imageVelocityX, ", ", imageVelocityY, ")",
+            //         ", ghostVelocity=(", this.uu_[ghostCellIndex], ", ", this.vv_[ghostCellIndex], ")");
+        }
+
+        inline proc updateFarfieldGhostVelocity(face: int) {
+            const elem1 = this.mesh_.edge2elem_[1, face];
+            const elem2 = this.mesh_.edge2elem_[2, face];
+            
+            // Determine which element is interior and which is ghost
+            const (interiorElem, ghostElem) = 
+                if elem1 <= this.nelemDomain_ then (elem1, elem2) else (elem2, elem1);
+            
+            // Impose velocity at face --> u_face = (u_interior + u_ghost)/2 --> u_ghost = 2*u_face - u_interior
+            const x = this.faceCentroidX_[face];
+            const y = this.faceCentroidY_[face];
+            
+            var u_face: real(64);
+            var v_face: real(64);
+            
+            if this.inputs_.FARFIELD_BC_TYPE_ == "cylinder" {
+                // Analytical cylinder velocity:
+                // V_r = U_∞ * (1 - R²/r²) * cos(θ)
+                // V_θ = -U_∞ * (1 + R²/r²) * sin(θ)
+                // u = V_r * cos(θ) - V_θ * sin(θ)
+                // v = V_r * sin(θ) + V_θ * cos(θ)
+                const R = this.inputs_.CYLINDER_RADIUS_;
+                const r2 = x*x + y*y;
+                const R2_over_r2 = R*R / r2;
+                const theta = atan2(y, x);
+                const cos_theta = cos(theta);
+                const sin_theta = sin(theta);
+                
+                const Vr = this.inputs_.VEL_INF_ * (1.0 - R2_over_r2) * cos_theta;
+                const Vtheta = -this.inputs_.VEL_INF_ * (1.0 + R2_over_r2) * sin_theta;
+                
+                u_face = Vr * cos_theta - Vtheta * sin_theta;
+                v_face = Vr * sin_theta + Vtheta * cos_theta;
+            }
+            else {
+                // Default freestream BC
+                u_face = this.inputs_.U_INF_;
+                v_face = this.inputs_.V_INF_;
+            }
+            
+            this.uu_[ghostElem] = 2*u_face - this.uu_[interiorElem];
+            this.vv_[ghostElem] = 2*v_face - this.vv_[interiorElem];
+        }
+        
+        forall face in this.mesh_.edgeFarfield_ do updateFarfieldGhostVelocity(face);
+    }
+
+    override proc run() {
+        this.updateGhostCellsPhi();         // Update ghost phi values for gradient computation
+        this.computeVelocityFromPhiLeastSquaresQR();
+        this.computeDensityFromVelocity();
+        this.updateGhostCellsVelocity();    // Update ghost velocities for flux computation
+        this.computeFaceProperties();
+        this.artificialDensity();
+        this.computeFluxes();
+        this.computeResiduals();
     }
 }
 

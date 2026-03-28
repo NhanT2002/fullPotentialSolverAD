@@ -1,6 +1,7 @@
 module temporalDiscretizationAD {
 use CTypes;
 use temporalDiscretization;
+use temporalDiscretizationADIBM;
 use temporalDiscretizationAnalyticalExact;
 use Set;
 
@@ -27,6 +28,11 @@ proc temporalDiscretization.pickADRow(): int {
 
 proc temporalDiscretization.enforceConsistentGammaForCurrentPhi(maxIts: int = 12,
                                                                 tol: real(64) = 1.0e-14) {
+    if this.spatialDisc_.isIBMFlow() {
+        this.enforceIBMConsistentGammaForCurrentPhi(maxIts, tol);
+        return;
+    }
+
     const sd = this.spatialDisc_.borrow();
     const phiDom = {0..<this.spatialDisc_.nelemDomain_};
     const n = this.spatialDisc_.nelemDomain_: c_int;
@@ -59,6 +65,11 @@ proc temporalDiscretization.enforceConsistentGammaForCurrentPhi(maxIts: int = 12
 }
 
 proc temporalDiscretization.computeADReducedExactJacobian() {
+    if this.spatialDisc_.isIBMFlow() {
+        this.computeIBMADReducedExactJacobian();
+        return;
+    }
+
     this.A_petsc.zeroEntries();
 
     const sd = this.spatialDisc_.borrow();
@@ -126,6 +137,11 @@ proc temporalDiscretization.computeADReducedExactJacobian() {
 }
 
 proc temporalDiscretization.runADRowCheck() {
+    if this.spatialDisc_.isIBMFlow() {
+        this.runIBMADRowCheck();
+        return;
+    }
+
     if AD_ROW < 0 {
         this.runADKuttaCheck();
         return;
@@ -290,6 +306,11 @@ proc temporalDiscretization.runADRowCheck() {
 }
 
 proc temporalDiscretization.runADKuttaCheck() {
+    if this.spatialDisc_.isIBMFlow() {
+        this.runIBMADKuttaCheck();
+        return;
+    }
+
     writeln("Running AD Kutta Jacobian check");
 
     const stencil = this.buildKuttaStencil();

@@ -310,12 +310,9 @@ class LeastSquaresGradientQR {
                 const dy = elemCentroidY[neighbor] - cy;
                 const t = theta[face];
                 
-                const tdx = t * dx;
-                const tdy = t * dy;
-                
-                sum_tdx_sq  += tdx * tdx;
-                sum_tdx_tdy += tdx * tdy;
-                sum_tdy_sq  += tdy * tdy;
+                sum_tdx_sq  += t * dx * dx;
+                sum_tdx_tdy += t * dx * dy;
+                sum_tdy_sq  += t * dy * dy;
             }
             
             // R matrix entries (Eq. 5.59 for 2D)
@@ -355,8 +352,8 @@ class LeastSquaresGradientQR {
                 const wx = alpha1 - r12_r11 * alpha2;
                 const wy = alpha2;
                 
-                this.wxFinal1_[face] = wx * t;
-                this.wyFinal1_[face] = wy * t;
+                this.wxFinal1_[face] = wx;
+                this.wyFinal1_[face] = wy;
             }
             
             // Weights for elem2's gradient (neighbor is elem1)
@@ -378,8 +375,8 @@ class LeastSquaresGradientQR {
                 const wx = alpha1 - r12_r11 * alpha2;
                 const wy = alpha2;
                 
-                this.wxFinal2_[face] = wx * t;
-                this.wyFinal2_[face] = wy * t;
+                this.wxFinal2_[face] = wx;
+                this.wyFinal2_[face] = wy;
             }
         }
 

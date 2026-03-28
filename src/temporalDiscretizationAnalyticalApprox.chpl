@@ -197,7 +197,9 @@ proc temporalDiscretization.computeApproximateAnalyticalJacobian() {
                 offdiag *= sign * area * rhoFace;
                 offdiag += directCoeff * area * rhoFace;
 
-                this.A_petsc.add(elem - 1, neighbor - 1, offdiag * this.spatialDisc_.res_scale_);
+                this.addJacobianEntry(elem - 1, neighbor - 1,
+                                      offdiag * this.spatialDisc_.res_scale_,
+                                      "computeApproximateAnalyticalJacobian face offdiag");
 
                 const dgradX_elem = this.dgradX_dGamma_[elem];
                 const dgradY_elem = this.dgradY_dGamma_[elem];
@@ -238,17 +240,20 @@ proc temporalDiscretization.computeApproximateAnalyticalJacobian() {
             }
         }
 
-        this.A_petsc.add(elem - 1, elem - 1, diag * this.spatialDisc_.res_scale_);
+        this.addJacobianEntry(elem - 1, elem - 1,
+                              diag * this.spatialDisc_.res_scale_,
+                              "computeApproximateAnalyticalJacobian diagonal");
         if dRes_dGamma != 0.0 {
             const dRes_dPhi_upper = dRes_dGamma;
             const dRes_dPhi_lower = -dRes_dGamma;
-
-            const wakeFaceIndex = this.spatialDisc_.wakeFaceIndexInfluenceOnElem_[elem];
-            const upperTE_influences = this.spatialDisc_.wakeFaceUpper_[wakeFaceIndex];
-            const lowerTE_influences = this.spatialDisc_.wakeFaceLower_[wakeFaceIndex];
-
-            this.A_petsc.add(elem - 1, upperTE_influences - 1, dRes_dPhi_upper);
-            this.A_petsc.add(elem - 1, lowerTE_influences - 1, dRes_dPhi_lower);
+            var upperTEinfluence = 0;
+            var lowerTEinfluence = 0;
+            if this.getReducedGammaSupportColumns(elem, upperTEinfluence, lowerTEinfluence) {
+                this.addJacobianEntry(elem - 1, upperTEinfluence - 1, dRes_dPhi_upper,
+                                      "computeApproximateAnalyticalJacobian reduced-gamma upper");
+                this.addJacobianEntry(elem - 1, lowerTEinfluence - 1, dRes_dPhi_lower,
+                                      "computeApproximateAnalyticalJacobian reduced-gamma lower");
+            }
         }
 
         // Store diag for possible use in upwinding
@@ -289,12 +294,16 @@ proc temporalDiscretization.computeApproximateAnalyticalJacobian() {
                         const diagTerm = this.Jij_[elem];
                         if diagTerm >= 0.0 {
                             // Increase diagonal and decrease off-diagonal
-                            this.A_petsc.add(elem-1, elem-1, increase);
-                            this.A_petsc.add(elem-1, upwindElem-1, -increase);
+                            this.addJacobianEntry(elem - 1, elem - 1, increase,
+                                                  "computeApproximateAnalyticalJacobian beta diag+");
+                            this.addJacobianEntry(elem - 1, upwindElem - 1, -increase,
+                                                  "computeApproximateAnalyticalJacobian beta offdiag-");
                         } else {
                             // Decrease diagonal and increase off-diagonal
-                            this.A_petsc.add(elem-1, elem-1, -increase);
-                            this.A_petsc.add(elem-1, upwindElem-1, increase);
+                            this.addJacobianEntry(elem - 1, elem - 1, -increase,
+                                                  "computeApproximateAnalyticalJacobian beta diag-");
+                            this.addJacobianEntry(elem - 1, upwindElem - 1, increase,
+                                                  "computeApproximateAnalyticalJacobian beta offdiag+");
                         }
                     }
                 }
@@ -303,5 +312,6 @@ proc temporalDiscretization.computeApproximateAnalyticalJacobian() {
     }
 
     this.A_petsc.assemblyComplete();
+    // this.A_petsc.matView();
 }
 }

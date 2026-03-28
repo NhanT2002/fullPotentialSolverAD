@@ -1,5 +1,5 @@
 use Math;
-config const FLOW : string = "steady"; // "steady" or "unsteady"
+config const FLOW : string = "steady"; // "steady" or "unsteady or IBM"
 
 config const GRID_FILENAME : string;
 config const START_FILENAME : string;
@@ -261,7 +261,7 @@ record potentialInputs {
     }
 
     proc ref initializeFlowField() {
-        if this.FLOW_ == "steady"{
+        if this.FLOW_ == "steady" || this.FLOW_ == "IBM" {
             this.RHO_INF_ = 1.0;
             this.VEL_INF_ = 1.0;
             this.a_INF_ = this.VEL_INF_ / this.MACH_;
