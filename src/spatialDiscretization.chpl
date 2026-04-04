@@ -262,6 +262,24 @@ class spatialDiscretization {
         forall face in this.mesh_.edgeWall_ do computeGhostCentroid(face);
         forall face in this.mesh_.edgeFarfield_ do computeGhostCentroid(face);
 
+        // For the wake ghost, copy the centroid from the corresponding opposite side cell
+        forall wakeIdx in this.mesh_.wakeCellDomain_ {
+            const upperWakeFace = this.mesh_.edgeUpperWake_[wakeIdx];
+            const lowerWakeFace = this.mesh_.edgeLowerWake_[wakeIdx];
+            const upperElem1 = this.mesh_.edge2elem_[1, upperWakeFace];
+            const upperElem2 = this.mesh_.edge2elem_[2, upperWakeFace];
+            const lowerElem1 = this.mesh_.edge2elem_[1, lowerWakeFace];
+            const lowerElem2 = this.mesh_.edge2elem_[2, lowerWakeFace];
+            const (upperInteriorElem, upperGhostElem) = 
+                if upperElem1 <= this.nelemDomain_ then (upperElem1, upperElem2) else (upperElem2, upperElem1);
+            const (lowerInteriorElem, lowerGhostElem) = 
+                if lowerElem1 <= this.nelemDomain_ then (lowerElem1, lowerElem2) else (lowerElem2, lowerElem1);
+            this.elemCentroidX_[upperGhostElem] = this.elemCentroidX_[lowerInteriorElem];
+            this.elemCentroidY_[upperGhostElem] = this.elemCentroidY_[lowerInteriorElem];
+            this.elemCentroidX_[lowerGhostElem] = this.elemCentroidX_[upperInteriorElem];
+            this.elemCentroidY_[lowerGhostElem] = this.elemCentroidY_[upperInteriorElem];
+        }
+
         // Compute face centroids, areas, and normals in a single pass
         forall face in 1..this.nface_ {
             const node1 = this.mesh_.edge2node_[1, face];
@@ -435,6 +453,8 @@ class spatialDiscretization {
 
         this.deltaSlowerTEx_ = this.TEnodeXcoord_ - this.elemCentroidX_[this.lowerTEelem_];
         this.deltaSlowerTEy_ = this.TEnodeYcoord_ - this.elemCentroidY_[this.lowerTEelem_];
+
+        this.kuttaCell_ = 0;
     }
 
     proc rebuildWakeMetadataFromCurrentKuttaCells() {
@@ -577,6 +597,22 @@ class spatialDiscretization {
         
         forall face in this.mesh_.edgeWall_ do updateWallGhostPhi(face);
         forall face in this.mesh_.edgeFarfield_ do updateFarfieldGhostPhi(face);
+
+        forall wakeIdx in this.mesh_.wakeCellDomain_ {
+            const upperWakeFace = this.mesh_.edgeUpperWake_[wakeIdx];
+            const lowerWakeFace = this.mesh_.edgeLowerWake_[wakeIdx];
+            const upperElem1 = this.mesh_.edge2elem_[1, upperWakeFace];
+            const upperElem2 = this.mesh_.edge2elem_[2, upperWakeFace];
+            const lowerElem1 = this.mesh_.edge2elem_[1, lowerWakeFace];
+            const lowerElem2 = this.mesh_.edge2elem_[2, lowerWakeFace];
+            const (upperInteriorElem, upperGhostElem) = 
+                if upperElem1 <= this.nelemDomain_ then (upperElem1, upperElem2) else (upperElem2, upperElem1);
+            const (lowerInteriorElem, lowerGhostElem) = 
+                if lowerElem1 <= this.nelemDomain_ then (lowerElem1, lowerElem2) else (lowerElem2, lowerElem1);
+            // For now, copy phi from upper element to lower element ghost cell and vice versa. This is a simple approach that maintains continuity across the wake.
+            this.phi_[upperGhostElem] = this.phi_[lowerInteriorElem];
+            this.phi_[lowerGhostElem] = this.phi_[upperInteriorElem];
+        }
     }
 
     proc updateGhostCellsVelocity() {
@@ -646,6 +682,24 @@ class spatialDiscretization {
         
         forall face in this.mesh_.edgeWall_ do updateWallGhostVelocity(face);
         forall face in this.mesh_.edgeFarfield_ do updateFarfieldGhostVelocity(face);
+
+        forall wakeIdx in this.mesh_.wakeCellDomain_ {
+            const upperWakeFace = this.mesh_.edgeUpperWake_[wakeIdx];
+            const lowerWakeFace = this.mesh_.edgeLowerWake_[wakeIdx];
+            const upperElem1 = this.mesh_.edge2elem_[1, upperWakeFace];
+            const upperElem2 = this.mesh_.edge2elem_[2, upperWakeFace];
+            const lowerElem1 = this.mesh_.edge2elem_[1, lowerWakeFace];
+            const lowerElem2 = this.mesh_.edge2elem_[2, lowerWakeFace];
+            const (upperInteriorElem, upperGhostElem) = 
+                if upperElem1 <= this.nelemDomain_ then (upperElem1, upperElem2) else (upperElem2, upperElem1);
+            const (lowerInteriorElem, lowerGhostElem) = 
+                if lowerElem1 <= this.nelemDomain_ then (lowerElem1, lowerElem2) else (lowerElem2, lowerElem1);
+            // for now, copy velocity from upper element to lower element ghost cell and vice versa. This is a simple approach that maintains continuity across the wake.
+            this.uu_[upperGhostElem] = this.uu_[lowerInteriorElem];
+            this.vv_[upperGhostElem] = this.vv_[lowerInteriorElem];
+            this.uu_[lowerGhostElem] = this.uu_[upperInteriorElem];
+            this.vv_[lowerGhostElem] = this.vv_[upperInteriorElem];
+        }
     }
 
     proc computeGradientGreenGauss(ref phi: [] real(64), 
@@ -787,7 +841,7 @@ class spatialDiscretization {
         //   - dφ/dl = (φ2 - φ1) * invL_IJ (direct phi difference)
         //   - corrCoeff = n / (n · t_IJ) (precomputed)
         
-        for face in 1..this.nface_ {
+        forall face in 1..this.nface_ {
             const elem1 = this.mesh_.edge2elem_[1, face];
             const elem2 = this.mesh_.edge2elem_[2, face];
 
@@ -796,11 +850,6 @@ class spatialDiscretization {
             
             const uAvg = weight1 * this.uu_[elem1] + weight2 * this.uu_[elem2];
             const vAvg = weight1 * this.vv_[elem1] + weight2 * this.vv_[elem2];
-
-            writeln("Face ", face, " elem1: ", elem1, " elem2: ", elem2,
-                    " uu_[elem1]: ", this.uu_[elem1], " uu_[elem2]: ", this.uu_[elem2],
-                    " vv_[elem1]: ", this.vv_[elem1], " vv_[elem2]: ", this.vv_[elem2],
-                    " uAvg: ", uAvg, " vAvg: ", vAvg);
 
             // Get phi values with potential jump across wake
             var phi1 = this.phi_[elem1];

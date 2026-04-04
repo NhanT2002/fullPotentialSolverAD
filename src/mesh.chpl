@@ -90,12 +90,16 @@ proc readMesh(filename: string, elementType: string) {
 
     const dsetUpperWakeCell = "/Base/dom-1/WakeLinkage/upperCell/ data";
     const dsetLowerWakeCell = "/Base/dom-1/WakeLinkage/lowerCell/ data";
+    const dsetUpperWake = "/Base/dom-1/wake_upper/ElementConnectivity/ data";
+    const dsetLowerWake = "/Base/dom-1/wake_lower/ElementConnectivity/ data";
     var upperWakeCell = read1DDataset(int, file_id, dsetUpperWakeCell);
     var lowerWakeCell = read1DDataset(int, file_id, dsetLowerWakeCell);
+    var upperWakeElement2node = read1DDataset(int, file_id, dsetUpperWake);
+    var lowerWakeElement2node = read1DDataset(int, file_id, dsetLowerWake);
 
     H5Fclose(file_id);
 
-    return (X, Y, Z, element2node, wallElement2node, farfieldElement2node, upperWakeCell, lowerWakeCell);
+    return (X, Y, Z, element2node, wallElement2node, farfieldElement2node, upperWakeElement2node, lowerWakeElement2node, upperWakeCell, lowerWakeCell);
 }
 
 // proc readMesh(filename: string, elementType: string) {
@@ -215,9 +219,16 @@ class MeshData {
     var wakeCellDomain_: domain(1) = {1..0}; // empty domain, can resize
     var upperWakeCell_: [wakeCellDomain_] int;
     var lowerWakeCell_: [wakeCellDomain_] int;
+    var wakeElement2node_dom: domain(1) = {1..0}; // empty domain, can resize
+    var upperWakeElement2node_: [wakeElement2node_dom] int;
+    var lowerWakeElement2node_: [wakeElement2node_dom] int;
+    var edgeUpperWake_dom: domain(1) = {1..0}; // empty domain, can resize
+    var edgeLowerWake_dom: domain(1) = {1..0}; // empty domain, can resize
+    var edgeUpperWake_: [edgeUpperWake_dom] int;
+    var edgeLowerWake_: [edgeLowerWake_dom] int;
 
     proc init(X : [] real(64), Y : [] real(64), elem2node : [] int, elem2nodeIndex : [] int,
-               wallElem2node : [] int, farfieldElem2node : [] int, upperWakeCell : [] int, lowerWakeCell : [] int) {
+               wallElem2node : [] int, farfieldElem2node : [] int, upperWakeElement2node : [] int, lowerWakeElement2node : [] int, upperWakeCell : [] int, lowerWakeCell : [] int) {
         this.X_dom = {1..X.size};
         this.elem2node_dom = {1..elem2node.size};
         this.elem2nodeIndex_dom = {1..elem2nodeIndex.size};
@@ -236,10 +247,13 @@ class MeshData {
         this.wakeCellDomain_ = {1..upperWakeCell.size};
         this.upperWakeCell_ = upperWakeCell;
         this.lowerWakeCell_ = lowerWakeCell;
+        this.wakeElement2node_dom = {1..upperWakeElement2node.size};
+        this.upperWakeElement2node_ = upperWakeElement2node;
+        this.lowerWakeElement2node_ = lowerWakeElement2node;
     }
 
     proc init(filename: string, elementType: string) {
-        var (Xtmp, Ytmp, Ztmp, element2nodeTmp, wallTmp, farfieldTmp, upperWakeCell, lowerWakeCell) = readMesh(filename, elementType);
+        var (Xtmp, Ytmp, Ztmp, element2nodeTmp, wallTmp, farfieldTmp, upperWakeElement2node, lowerWakeElement2node, upperWakeCell, lowerWakeCell) = readMesh(filename, elementType);
 
         var nelem = 0;
         var nnode = 0;
@@ -258,7 +272,7 @@ class MeshData {
             elem2nodeIndexTmp[i + 1] = elem2nodeIndexTmp[i] + nnode;
         }
 
-        this.init(Xtmp, Ytmp, element2nodeTmp, elem2nodeIndexTmp, wallTmp, farfieldTmp, upperWakeCell, lowerWakeCell);
+        this.init(Xtmp, Ytmp, element2nodeTmp, elem2nodeIndexTmp, wallTmp, farfieldTmp, upperWakeElement2node, lowerWakeElement2node, upperWakeCell, lowerWakeCell);
         this.elementType_ = elementType;
 
         writeln("upperWakeCell_ = ", this.upperWakeCell_);
@@ -311,6 +325,27 @@ class MeshData {
         // writeln("esuel_ = ", this.esuel_.shape, " = ", this.esuel_);
         // writeln("esuelIndex_ = ", this.esuelIndex_.shape, " = ", this.esuelIndex_);
         // writeln("elemToLocalEdgeIndex_ = ", this.elemToLocalEdgeIndex_.size, " = ", this.elemToLocalEdgeIndex_);
+
+        // Rebuild upperWakeCell_ and lowerWakeCell_ based on edge2elem_ to ensure consistency
+        for wakeidx in this.edgeUpperWake_dom {
+            const face = this.edgeUpperWake_[wakeidx];
+            const elem1 = this.edge2elem_[1, face];
+            const elem2 = this.edge2elem_[2, face];
+            const (interiorElem, ghostElem) = 
+                if elem1 <= this.nelem_ then (elem1, elem2) else (elem2, elem1);
+            this.upperWakeCell_[wakeidx] = interiorElem;
+        }
+        for wakeidx in this.edgeLowerWake_dom {
+            const face = this.edgeLowerWake_[wakeidx];
+            const elem1 = this.edge2elem_[1, face];
+            const elem2 = this.edge2elem_[2, face];
+            const (interiorElem, ghostElem) = 
+                if elem1 <= this.nelem_ then (elem1, elem2) else (elem2, elem1);
+            this.lowerWakeCell_[wakeidx] = interiorElem;
+        }
+        writeln("After building connectivity with ghost cells:");
+        writeln("upperWakeCell_ = ", this.upperWakeCell_);
+        writeln("lowerWakeCell_ = ", this.lowerWakeCell_);
         
 
         if elem != 0 {
@@ -440,6 +475,30 @@ class MeshData {
             }
         }
 
+        // Process wake edges from CGNS connectivity (2 nodes per edge)
+        var edgeUpperWake = new list(int);
+        const nUpperWakeEdges = this.upperWakeElement2node_.size / 2;
+        for i in 0..<nUpperWakeEdges {
+            const n1 = this.upperWakeElement2node_[2*i + 1];
+            const n2 = this.upperWakeElement2node_[2*i + 2];
+            const ip = min(n1, n2);
+            const jp = max(n1, n2);
+            if edgeMap.contains((ip, jp)) {
+                edgeUpperWake.pushBack(try! edgeMap[(ip, jp)]);
+            }
+        }
+        var edgeLowerWake = new list(int);
+        const nLowerWakeEdges = this.lowerWakeElement2node_.size / 2;
+        for i in 0..<nLowerWakeEdges {
+            const n1 = this.lowerWakeElement2node_[2*i + 1];
+            const n2 = this.lowerWakeElement2node_[2*i + 2];
+            const ip = min(n1, n2);
+            const jp = max(n1, n2);
+            if edgeMap.contains((ip, jp)) {
+                edgeLowerWake.pushBack(try! edgeMap[(ip, jp)]);
+            }
+        }
+
         this.edgeWall_dom = {1..edgeWall.size};
         for (i, edge) in zip(this.edgeWall_dom, edgeWall) {
             this.edgeWall_[i] = edge;
@@ -448,6 +507,16 @@ class MeshData {
         this.edgeFarfield_dom = {1..edgeFarfield.size};
         for (i, edge) in zip(this.edgeFarfield_dom, edgeFarfield) {
             this.edgeFarfield_[i] = edge;
+        }
+
+        this.edgeUpperWake_dom = {1..edgeUpperWake.size};
+        for (i, edge) in zip(this.edgeUpperWake_dom, edgeUpperWake) {
+            this.edgeUpperWake_[i] = edge;
+        }
+
+        this.edgeLowerWake_dom = {1..edgeLowerWake.size};
+        for (i, edge) in zip(this.edgeLowerWake_dom, edgeLowerWake) {
+            this.edgeLowerWake_[i] = edge;
         }
     }
 

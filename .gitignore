@@ -10,3 +10,5 @@ doc/
 champs/
 build/
 */__pycache__/
+*.venv/
+*.log
