@@ -9,3 +9,4 @@ bin/*
 doc/
 champs/
 build/
+*/__pycache__/

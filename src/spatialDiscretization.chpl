@@ -797,6 +797,11 @@ class spatialDiscretization {
             const uAvg = weight1 * this.uu_[elem1] + weight2 * this.uu_[elem2];
             const vAvg = weight1 * this.vv_[elem1] + weight2 * this.vv_[elem2];
 
+            writeln("Face ", face, " elem1: ", elem1, " elem2: ", elem2,
+                    " uu_[elem1]: ", this.uu_[elem1], " uu_[elem2]: ", this.uu_[elem2],
+                    " vv_[elem1]: ", this.vv_[elem1], " vv_[elem2]: ", this.vv_[elem2],
+                    " uAvg: ", uAvg, " vAvg: ", vAvg);
+
             // Get phi values with potential jump across wake
             var phi1 = this.phi_[elem1];
             var phi2 = this.phi_[elem2];
@@ -1208,7 +1213,7 @@ class spatialDiscretization {
         fieldsWake["nyWake"] = nyWake;
         fieldsWake["gammaWake"] = gammaWake;
 
-        writer.writeWakeToCGNS(this.wakeFaceX_, this.wakeFaceY_, this.wakeFaceZ_, wake_dom, fieldsWake);
+        // writer.writeWakeToCGNS(this.wakeFaceX_, this.wakeFaceY_, this.wakeFaceZ_, wake_dom, fieldsWake);
     }
 
     proc writeSolution() {

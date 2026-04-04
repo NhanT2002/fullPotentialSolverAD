@@ -25,7 +25,7 @@ proc main() {
 
         var Mesh = new shared MeshData(inputs.GRID_FILENAME_, inputs.ELEMENT_TYPE_);
         Mesh.buildConnectivity();
-        writeln("Mesh loaded: ", Mesh.nelem_, " elements");
+        writeln("Mesh loaded: ", Mesh.nelem_, " elements, ", Mesh.nedge_, " faces.");
 
         if inputs.FLOW_ == "steady" {
             var spatialDisc = new shared spatialDiscretization(Mesh, inputs);
